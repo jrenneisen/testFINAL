@@ -563,6 +563,33 @@ def retrieve_hybrid(
     return fused
 
 
+# ─── RRF helper (pre-scored lists) ───────────────────────────────────────────
+def reciprocal_rank_fusion(
+    dense_results: list[tuple[str, float]],
+    sparse_results: list[tuple[str, float]],
+    rrf_k: int = 60,
+    dense_weight: float = 0.7,
+    sparse_weight: float = 0.3,
+) -> list[tuple[str, float]]:
+    """
+    Merge two pre-computed ranked lists via Reciprocal Rank Fusion (Cormack 2009).
+    Works on any (job_id, score) lists — no index or DataFrame needed.
+
+    RRF formula:  score(d) = Σ_m  w_m / (rrf_k + rank_m(d))
+    """
+    rrf_scores: dict[str, float] = {}
+    for rank, (job_id, _) in enumerate(dense_results):
+        rrf_scores[job_id] = rrf_scores.get(job_id, 0.0) + dense_weight / (rrf_k + rank + 1)
+    for rank, (job_id, _) in enumerate(sparse_results):
+        rrf_scores[job_id] = rrf_scores.get(job_id, 0.0) + sparse_weight / (rrf_k + rank + 1)
+    fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+    logger.info(
+        f"RRF fusion: {len(dense_results)} dense + {len(sparse_results)} sparse "
+        f"→ {len(fused)} candidates"
+    )
+    return fused
+
+
 # ─── Benchmark ────────────────────────────────────────────────────────────────
 def benchmark_retrieval(
     profile: dict,
@@ -614,32 +641,34 @@ def benchmark_retrieval(
     }
 
 
-# ─── Live-job scoring (Kaggle trains → JSearch delivers) ─────────────────────
+# ─── Live-job scoring (corpus → embed → rank) ────────────────────────────────
 def embed_and_score_live_jobs(
     profile: dict,
     live_df: pd.DataFrame,
     preferred_clusters: set | None = None,
     avoided_clusters: set | None = None,
-) -> tuple[list[tuple[str, float]], dict[str, int]]:
+    retrieval_mode: str = "hybrid",
+) -> tuple[list[tuple[str, float]], dict[str, int], np.ndarray, np.ndarray]:
     """
-    Embed freshly-fetched live job postings (JSearch) and score them against
-    the user profile using the trained sentence-transformer model.
+    Embed job postings and score them against the user profile.
 
-    Architecture:
-    - The embedding model and K-Means cluster centroids were learned from the
-      Kaggle training corpus (50k+ jobs). This is the "training" phase.
-    - This function applies that learned representation to *new*, unseen live
-      job postings — this is the "inference / delivery" phase.
-    - Cluster centroids from training are loaded and used to assign each live
-      job to a semantic job family. Preferred/avoided families get score boosts.
+    Parameters:
+        profile:            user profile dict
+        live_df:            DataFrame of jobs to score
+        preferred_clusters: cluster IDs to boost
+        avoided_clusters:   cluster IDs to penalise
+        retrieval_mode:     "hybrid"  → dense FAISS scores only (semantic)
+                            "dense"   → same (both modes use the dense vectors;
+                                        TF-IDF merge is handled in _run_full_pipeline)
 
     Returns:
-        candidates:  list of (job_id, score) sorted descending by match score
-        cluster_map: {job_id: cluster_id} — cluster assignment for each live job
-                     (stored in session state so feedback updates cluster preferences)
+        candidates:  list of (job_id, score) sorted descending
+        cluster_map: {job_id: cluster_id}
+        job_embs:    (n, 384) float32 array — job embedding matrix
+        profile_emb: (384,)  float32 — profile embedding vector
     """
     if live_df.empty:
-        return [], {}
+        return [], {}, np.empty((0, 384), dtype="float32"), np.zeros(384, dtype="float32")
 
     profile_text  = build_profile_text(profile)
     profile_emb   = embed_single(profile_text)          # (384,) L2-normalised
@@ -657,7 +686,6 @@ def embed_and_score_live_jobs(
         try:
             data        = np.load(CLUSTERS_FILE, allow_pickle=True)
             centers     = data["centers"]               # (n_clusters, 384)
-            # centers @ job_embs.T → (n_clusters, n_live); argmax along axis=0
             assignments = np.argmax(centers @ job_embs.T, axis=0)   # (n_live,)
             for jid, cluster in zip(job_ids_list, assignments.tolist()):
                 cluster_map[jid] = int(cluster)
@@ -674,8 +702,11 @@ def embed_and_score_live_jobs(
             logger.warning(f"Cluster assignment skipped for live jobs: {exc}")
 
     candidates = sorted(zip(job_ids_list, scores), key=lambda x: x[1], reverse=True)
-    logger.info(f"Scored {len(candidates)} live jobs against profile embedding")
-    return candidates, cluster_map
+    logger.info(
+        f"Scored {len(candidates)} jobs against profile embedding "
+        f"[mode={retrieval_mode}]"
+    )
+    return candidates, cluster_map, job_embs, profile_emb
 
 
 # ─── Convenience wrapper ──────────────────────────────────────────────────────

@@ -409,87 +409,8 @@ def _generate_synthetic_jobs(n: int = 5000) -> pd.DataFrame:
     return df
 
 
-# ─── Minimum corpus guarantee (JSearch) ──────────────────────────────────────
-MIN_CORPUS_ROWS = 5_000
-
-# Broad fallback queries used when the user's role-specific queries don't
-# return enough pre-dedup records. These are employment-signal queries
-# (not job-title specific) so they cast a wide net across the USA job market.
-_BROAD_FALLBACK_QUERIES = [
-    "full time jobs usa",
-    "remote jobs united states",
-    "entry level jobs",
-    "hiring now",
-    "jobs near me",
-    "professional jobs",
-    "tech jobs",
-    "business jobs",
-    "operations jobs",
-    "analyst jobs",
-    "manager jobs",
-    "coordinator jobs",
-]
-
-
-def broaden_jsearch_to_min(
-    df: pd.DataFrame,
-    min_rows: int = MIN_CORPUS_ROWS,
-    country: str = "us",
-    pages_per_query: int = 3,
-) -> pd.DataFrame:
-    """
-    If `df` has fewer than `min_rows` pre-dedup records, fetch additional
-    JSearch results using broad fallback queries until the floor is met.
-    Only real job data is added — no synthetic padding.
-
-    Args:
-        df:              Existing raw JSearch results (may be empty).
-        min_rows:        Pre-dedup record floor (default 5,000).
-        country:         ISO country code passed to JSearch.
-        pages_per_query: Pages to fetch per fallback query.
-
-    Returns:
-        Concatenated DataFrame with at least `min_rows` records,
-        or as many as available if JSearch is exhausted.
-    """
-    if len(df) >= min_rows:
-        return df
-
-    frames = [df] if not df.empty else []
-    seen_urls: set = set(df["url"].dropna().tolist()) if "url" in df.columns else set()
-
-    for q in _BROAD_FALLBACK_QUERIES:
-        current_count = sum(len(f) for f in frames)
-        if current_count >= min_rows:
-            break
-        logger.info(
-            f"JSearch pool at {current_count:,} rows — broadening with fallback query '{q}'"
-        )
-        extra = fetch_jsearch_jobs(
-            query=q,
-            num_pages=pages_per_query,
-            country=country,
-            date_posted="week",
-        )
-        if extra.empty:
-            continue
-        # Drop URLs already in the pool to avoid duplicates before dedup
-        if "url" in extra.columns:
-            extra = extra[~extra["url"].isin(seen_urls) & (extra["url"] != "")]
-            seen_urls.update(extra["url"].tolist())
-        if not extra.empty:
-            frames.append(extra)
-
-    if not frames:
-        logger.warning("JSearch returned no results even after broadening queries.")
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        f"JSearch pool after broadening: {len(combined):,} pre-dedup records "
-        f"(target was {min_rows:,})"
-    )
-    return combined
+# broaden_jsearch_to_min and minimum-corpus logic removed — pre-loaded mode
+# uses the Kaggle parquet as both training corpus and match pool.
 
 
 # ─── Save helpers ─────────────────────────────────────────────────────────────

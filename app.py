@@ -192,12 +192,100 @@ def init_session():
         "preloaded_autoloaded":       False, # True once disk auto-load has run this session
         "full_corpus_df":             None,  # ALL cleaned records BEFORE dedup — used for download
         # jobs_df = deduped corpus used for FAISS + scoring (smaller, higher quality)
+        "retrieval_mode":             "hybrid",   # "hybrid" or "dense"
+        "profile_emb":                None,       # (384,) float32 — profile embedding vector
+        "job_embs":                   None,       # (n, 384) float32 — job embedding matrix
+        "pre_feedback_top10":         [],         # snapshot of top-10 BEFORE adaptive feedback
+        # ── Per-profile result cache ───────────────────────────────────────────
+        # Maps cache_key → full pipeline result dict so switching profiles
+        # doesn't require re-running the pipeline.
+        "profile_results":            {},
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
 init_session()
+
+
+# ─── Per-profile result cache helpers ─────────────────────────────────────────
+# All pipeline results live in session state (in-memory). When the user switches
+# profiles we save the current results into profile_results[key] before clearing,
+# then attempt to restore from cache when the new profile is loaded.
+#
+# Cache keys:
+#   • Personas  →  persona["id"]  (stable ID from personas.json)
+#   • Logged-in custom profile  →  "{user_id}_custom"
+#   • Anonymous custom profile  →  "anon_custom"
+
+_CACHED_KEYS = [
+    "ranked_jobs", "pipeline_ready", "benchmark_data", "analytics",
+    "data_stats", "live_jobs_df", "jobs_df", "full_corpus_df",
+    "faiss_index", "job_ids", "cluster_labels",
+    "hybrid_candidates", "tfidf_candidates", "emb_candidates",
+    "live_cluster_map", "profile_emb", "job_embs",
+    "pre_feedback_top10", "retrieval_mode",
+]
+
+
+def _profile_cache_key(profile: dict | None = None) -> str:
+    """Return a stable string key for the given (or current) profile."""
+    p = profile or st.session_state.profile
+    if p is None:
+        return "__none__"
+    if "id" in p:                          # pre-built persona
+        return f"persona_{p['id']}"
+    uid = st.session_state.current_user
+    return f"{uid}_custom" if uid else "anon_custom"
+
+
+def _save_to_profile_cache(key: str | None = None):
+    """Snapshot current pipeline results into profile_results[key]."""
+    k = key or _profile_cache_key()
+    if k == "__none__" or not st.session_state.pipeline_ready:
+        return
+    st.session_state.profile_results[k] = {
+        ck: st.session_state.get(ck) for ck in _CACHED_KEYS
+    }
+    # Also store which profile produced these results (for display)
+    st.session_state.profile_results[k]["_profile"] = (
+        st.session_state.profile or {}
+    )
+
+
+def _load_from_profile_cache(profile: dict) -> bool:
+    """
+    Try to restore pipeline results for `profile` from the cache.
+    Returns True if a cached result was found and loaded, False otherwise.
+    """
+    k = _profile_cache_key(profile)
+    cached = st.session_state.profile_results.get(k)
+    if not cached or not cached.get("pipeline_ready"):
+        return False
+    for ck in _CACHED_KEYS:
+        if ck in cached:
+            st.session_state[ck] = cached[ck]
+    return True
+
+
+def _switch_profile(new_profile: dict):
+    """
+    Save current results to cache, then switch to new_profile.
+    Restores cached results for the new profile if available.
+    Returns True if cache hit (no re-run needed).
+    """
+    # Save outgoing profile's results
+    _save_to_profile_cache()
+    # Set new profile
+    st.session_state.profile = new_profile
+    # Attempt cache restore
+    if _load_from_profile_cache(new_profile):
+        return True   # cache hit — pipeline_ready stays True
+    # Cache miss — clear stale results
+    st.session_state.pipeline_ready = False
+    st.session_state.ranked_jobs    = []
+    return False
+
 
 # ─── Auto-detect pre-loaded parquet files from disk ───────────────────────────
 def _autoload_preloaded_data():
@@ -606,12 +694,20 @@ def page_profile():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                if st.button(f"Use {persona['emoji']}", key=f"persona_{i}",
-                             use_container_width=True):
-                    st.session_state.profile = persona
-                    st.session_state.pipeline_ready = False
-                    st.session_state.ranked_jobs = []
-                    st.success(f"✅ Profile set: {persona['name']}")
+                # Badge: show ✅ if this persona has cached results
+                cache_key = f"persona_{persona.get('id', i)}"
+                has_cache = bool(
+                    st.session_state.profile_results.get(cache_key, {}).get("pipeline_ready")
+                )
+                btn_label = f"{'✅ ' if has_cache else ''}{persona['emoji']} Load"
+                if st.button(btn_label, key=f"persona_{i}",
+                             use_container_width=True,
+                             help="Results cached — loads instantly" if has_cache else "Run pipeline after loading"):
+                    hit = _switch_profile(persona)
+                    if hit:
+                        st.success(f"✅ Loaded cached results for **{persona['name'].split('—')[0].strip()}**")
+                    else:
+                        st.success(f"✅ Profile set: {persona['name'].split('—')[0].strip()} — run the pipeline to find matches")
                     st.rerun()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -752,6 +848,11 @@ def page_profile():
             st.session_state.ranked_jobs    = []
 
             uid = st.session_state.current_user
+            # Invalidate any cached results for this custom profile slot —
+            # the profile changed so old matches are no longer valid
+            stale_key = f"{uid}_custom" if uid else "anon_custom"
+            st.session_state.profile_results.pop(stale_key, None)
+
             if uid:
                 save_profile(uid, profile_data)
                 st.success(
@@ -836,12 +937,21 @@ def page_profile():
                         st.caption("This profile is saved but not currently loaded.")
                 with lc2:
                     if not active:
-                        if st.button("🎯 Load for Matching", type="primary",
-                                     use_container_width=True, key="load_saved_profile"):
-                            st.session_state.profile = saved_profile
-                            st.session_state.pipeline_ready = False
-                            st.session_state.ranked_jobs    = []
-                            st.success(f"✅ Profile loaded: {p.get('name')}")
+                        # Check if there's a cached result for this profile
+                        uid = st.session_state.current_user
+                        saved_cache_key = f"{uid}_custom" if uid else "anon_custom"
+                        saved_has_cache = bool(
+                            st.session_state.profile_results.get(saved_cache_key, {}).get("pipeline_ready")
+                        )
+                        load_label = "✅ Load (cached)" if saved_has_cache else "🎯 Load for Matching"
+                        if st.button(load_label, type="primary",
+                                     use_container_width=True, key="load_saved_profile",
+                                     help="Results cached — loads instantly" if saved_has_cache else "Run pipeline after loading"):
+                            hit = _switch_profile(saved_profile)
+                            if hit:
+                                st.success(f"✅ Loaded cached results for **{p.get('name')}**")
+                            else:
+                                st.success(f"✅ Profile loaded: {p.get('name')} — run the pipeline to find matches")
                             st.rerun()
 
                 # ── Saved job list ────────────────────────────────────────────
@@ -934,300 +1044,198 @@ def _run_pipeline_section():
     PRELOADED_OPTION = "Pre-loaded dataset (no API needed)"
 
     st.info(
-        "📚 **Architecture:** A training corpus builds the embedding model & job-family clusters. "
-        "A live JSearch pool is then scored with that model and ranked for you. "
-        "At least 5,000 records are examined per search — synthetic data fills any gap automatically.",
+        "📚 **Architecture:** The Kaggle corpus is cleaned, deduplicated (MinHash LSH), "
+        "embedded with sentence-transformers, and indexed in FAISS. "
+        "Your profile is embedded and matched against the same corpus — no API key needed.",
         icon="ℹ️",
     )
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        # Show pre-loaded option if the Kaggle corpus is on disk
+        # Show pre-loaded option only if the Kaggle parquet is on disk
         has_preloaded = (DATA_DIR / "preloaded_kaggle_50k.parquet").exists()
-        corpus_options = ["Sample data (fast demo)", "Kaggle dataset (full corpus)"]
         if has_preloaded:
-            corpus_options.append(PRELOADED_OPTION)
+            corpus_options = [
+                PRELOADED_OPTION,
+                "Sample data (fast demo — 2k Kaggle rows)",
+                "Live JSearch (requires API key)",
+            ]
+            default_idx = 0
+        else:
+            corpus_options = [
+                "Sample data (fast demo — 2k Kaggle rows)",
+                "Live JSearch (requires API key)",
+            ]
+            default_idx = 0
         data_source = st.selectbox(
-            "Training corpus",
+            "Data source",
             corpus_options,
-            index=0,
+            index=default_idx,
             help=(
-                "Sample / Kaggle: trains the model; live JSearch jobs are the match pool.\n\n"
-                "Pre-loaded: on-disk 50k snapshot — no JSearch call needed."
+                "Pre-loaded: full Kaggle parquet (35k jobs) — recommended.\n\n"
+                "Sample: 2,000 random Kaggle rows — fast but less accurate.\n\n"
+                "Live JSearch: fetches fresh postings from the web (API key required)."
             ),
         )
     with col2:
-        is_preloaded = data_source == PRELOADED_OPTION
+        is_live_jsearch = "JSearch" in data_source
         live_queries = st.text_input(
-            "Live job search (JSearch)",
+            "Live job search queries",
             ", ".join(profile.get("target_roles", ["data scientist"])[:3]),
-            help="Queries sent to JSearch. Not used when Pre-loaded dataset is selected.",
-            disabled=is_preloaded,
+            help="Comma-separated queries sent to JSearch. Only used in Live JSearch mode.",
+            disabled=not is_live_jsearch,
         )
     with col3:
-        st.markdown("")
-        st.markdown("")
-        if is_preloaded:
-            n_kg = len(st.session_state.preloaded_kaggle_df) if st.session_state.preloaded_kaggle_df is not None else 0
-            st.caption(f"📂 {n_kg:,} jobs on disk — no API key needed")
-            run_btn = st.button("🚀 Run Pre-loaded Pipeline", type="primary",
-                                use_container_width=True)
-        else:
-            test_col, run_col = st.columns([1, 2])
-            with test_col:
-                if st.button("🔌 Test API", use_container_width=True,
-                             help="Verify JSearch API key works before running"):
-                    from src.ingest import test_jsearch_connection
-                    with st.spinner("Testing JSearch..."):
-                        ok = test_jsearch_connection()
-                    st.success("✅ Connected!") if ok else st.error("❌ Key issue")
-            with run_col:
-                run_btn = st.button("🚀 Load & Find Live Jobs", type="primary",
-                                    use_container_width=True)
+        retrieval_mode = st.selectbox(
+            "Retrieval mode",
+            ["Hybrid (FAISS + TF-IDF)", "Dense FAISS only"],
+            index=0,
+            help=(
+                "Hybrid: merges dense semantic search (FAISS) with keyword recall (TF-IDF). "
+                "Dense: pure embedding cosine similarity — faster, fully semantic."
+            ),
+        )
 
-    if not is_preloaded and not JSEARCH_API_KEY:
+    if has_preloaded and not is_live_jsearch:
+        n_kg = len(st.session_state.preloaded_kaggle_df) if st.session_state.preloaded_kaggle_df is not None else 0
+        st.caption(f"📂 {n_kg:,} Kaggle jobs on disk — no API key required")
+
+    if is_live_jsearch and not JSEARCH_API_KEY:
         st.warning(
             "⚠️ **JSearch API key not configured.** "
             "Add `JSEARCH_API_KEY` to your Streamlit Secrets to fetch live jobs.",
             icon="⚠️",
         )
 
+    # Show cached results banner if pipeline already ran
+    if st.session_state.pipeline_ready and st.session_state.ranked_jobs:
+        n_cached = len(st.session_state.ranked_jobs)
+        st.success(
+            f"✅ Pipeline results cached — **{n_cached} matches** ready. "
+            "Navigate to **Job Matches** to view, or re-run below to refresh.",
+            icon="✅",
+        )
+
+    retrieval_mode_key = "dense" if "Dense" in retrieval_mode else "hybrid"
+
+    col_run1, col_run2 = st.columns([3, 1])
+    with col_run1:
+        run_btn = st.button("🚀 Run Pipeline", type="primary", use_container_width=True)
+    with col_run2:
+        if is_live_jsearch:
+            if st.button("🔌 Test API", use_container_width=True,
+                         help="Verify JSearch API key works before running"):
+                from src.ingest import test_jsearch_connection
+                with st.spinner("Testing JSearch..."):
+                    ok = test_jsearch_connection()
+                st.success("✅ Connected!") if ok else st.error("❌ Key issue")
+
     if run_btn:
-        _run_full_pipeline(data_source, live_queries)
+        _run_full_pipeline(data_source, live_queries, retrieval_mode_key)
 
 
-def _run_full_pipeline(data_source: str, live_queries: str):
+def _run_full_pipeline(data_source: str, live_queries: str, retrieval_mode: str = "hybrid"):
     """
-    Two-phase pipeline with three corpus modes:
+    Unified pipeline. Three data-source modes:
 
-    Mode A — Sample / Kaggle (default):
-      Phase A: Kaggle corpus → FAISS index + K-Means clusters
-      Phase B: JSearch live jobs → embed with trained model → rank
+    Mode A — Pre-loaded (Kaggle parquet):
+      Phase A: Kaggle parquet → clean → dedup (MinHash LSH) → embed → FAISS + K-Means
+      Phase B: same corpus is the match pool — no JSearch call
 
-    Mode B — Pre-loaded (no API needed):
-      Phase A: combined 100k parquet (Kaggle 50k + USA JSearch 50k) → FAISS + K-Means
-      Phase B: same 40k dataset serves as the match pool (no JSearch call)
+    Mode B — Sample (2k random rows from Kaggle parquet):
+      Identical to Mode A but on a random 2,000-row sample for speed.
 
-    Users see ONLY the Phase B pool results.
+    Mode C — Live JSearch:
+      Phase A: Kaggle parquet used for FAISS/cluster training
+      Phase B: JSearch jobs fetched, cleaned, embedded, ranked
+
+    retrieval_mode: "hybrid" = dense FAISS + TF-IDF merged via RRF
+                   "dense"  = dense FAISS cosine only
     """
     profile = st.session_state.profile
-    PRELOADED_OPTION = "Pre-loaded dataset (40k, no API needed)"
+    PRELOADED_OPTION = "Pre-loaded dataset (no API needed)"
+    SAMPLE_OPTION    = "Sample data (fast demo — 2k Kaggle rows)"
     use_preloaded    = data_source == PRELOADED_OPTION
+    use_sample       = data_source == SAMPLE_OPTION
+    use_jsearch      = not use_preloaded and not use_sample
 
     with st.spinner("Running JobPilot pipeline..."):
         progress = st.progress(0)
         status   = st.empty()
 
         try:
-            # ══════════════════════════════════════════════════════════════════
-            # PRE-LOADED BRANCH — no JSearch API required
-            # ══════════════════════════════════════════════════════════════════
-            if use_preloaded:
-                kaggle_df = st.session_state.preloaded_kaggle_df
-
-                if kaggle_df is None:
-                    status.empty(); progress.empty()
-                    st.error(
-                        "❌ Kaggle corpus not found. "
-                        "Make sure preloaded_kaggle_50k.parquet is in the data/ folder."
-                    )
-                    return
-
-                # ── Phase A · Step 1: Load Kaggle training corpus ─────────
-                status.text(
-                    f"📥 Step 1/5: Loading Kaggle training corpus "
-                    f"({len(kaggle_df):,} jobs)…"
-                )
-                training_df = kaggle_df.copy()
-                if "job_id" not in training_df.columns:
-                    training_df["job_id"] = training_df.index.astype(str) + "_kaggle"
-                training_df = training_df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
-
-                # Snapshot BEFORE dedup — every cleaned record, used for download
-                st.session_state.full_corpus_df = training_df.copy()
-                progress.progress(15)
-
-                # ── Phase A · Step 2: Dedup training corpus ───────────────
-                status.text("🔍 Step 2/5: Deduplicating training corpus (MinHash LSH)…")
-                from src.dedupe import full_deduplication
-                training_df, dedup_stats = full_deduplication(training_df)
-                st.session_state.data_stats = dedup_stats
-                progress.progress(30)
-
-                # ── Phase A · Step 3: FAISS index + K-Means clusters ──────
-                status.text("🧠 Step 3/5: Building embedding index + job-family clusters…")
-                from src.embeddings import (
-                    load_or_build_index, build_job_clusters, get_cluster_labels,
-                    embed_and_score_live_jobs, tfidf_retrieve,
-                )
-                # Filter to embeddable records only for FAISS — non-embeddable
-                # rows (no/very short description) stay in training_df for download
-                if "embeddable" in training_df.columns:
-                    embeddable_df = training_df[training_df["embeddable"] == True].copy()
-                    n_non_emb = len(training_df) - len(embeddable_df)
-                    if n_non_emb > 0:
-                        logger.info(
-                            f"Excluded {n_non_emb:,} non-embeddable rows from FAISS "
-                            f"(kept in download dataset)"
-                        )
-                else:
-                    embeddable_df = training_df.copy()
-                index, embeddings, training_job_ids = load_or_build_index(embeddable_df)
-                st.session_state.faiss_index = index
-                st.session_state.job_ids     = training_job_ids
-                st.session_state.jobs_df     = training_df  # deduped — used for FAISS + scoring
-
-                cluster_labels = get_cluster_labels(training_job_ids)
-                if cluster_labels is None:
-                    cluster_labels = build_job_clusters(embeddings, training_job_ids)
-                st.session_state.cluster_labels = cluster_labels
-                progress.progress(50)
-
-                # ── Phase B · Step 4: Score Kaggle corpus as match pool ───
-                # The Kaggle corpus doubles as the match pool — no JSearch needed.
-                status.text(
-                    f"🎯 Step 4/5: Scoring {len(training_df):,} Kaggle jobs against your profile…"
-                )
-                live_df = training_df.copy()
-                live_df = live_df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
-                st.session_state.live_jobs_df = live_df
-                st.toast(f"✅ {len(live_df):,} jobs loaded from pre-built Kaggle corpus")
-
-                preferred_clusters, avoided_clusters = set(), set()
-                live_cluster_map = st.session_state.live_cluster_map
-                if st.session_state.feedback and live_cluster_map:
-                    pos_counts: dict[int, int] = {}
-                    neg_counts: dict[int, int] = {}
-                    for job_id, fb_type in st.session_state.feedback.items():
-                        cluster = live_cluster_map.get(job_id)
-                        if cluster is None:
-                            continue
-                        if fb_type in ("good", "save"):
-                            pos_counts[cluster] = pos_counts.get(cluster, 0) + 1
-                        elif fb_type == "bad":
-                            neg_counts[cluster] = neg_counts.get(cluster, 0) + 1
-                    preferred_clusters = {c for c, n in pos_counts.items() if n >= 2}
-                    avoided_clusters   = {c for c, n in neg_counts.items() if n >= 2} - preferred_clusters
-
-                hybrid_candidates, new_cluster_map = embed_and_score_live_jobs(
-                    profile, live_df,
-                    preferred_clusters=preferred_clusters,
-                    avoided_clusters=avoided_clusters,
-                )
-                st.session_state.live_cluster_map  = {**live_cluster_map, **new_cluster_map}
-                st.session_state.hybrid_candidates = hybrid_candidates
-                st.session_state.emb_candidates    = hybrid_candidates
-
-                tfidf_candidates = tfidf_retrieve(profile, live_df,
-                                                  k=min(RETRIEVAL_K, len(live_df)))
-                st.session_state.tfidf_candidates = tfidf_candidates
-                progress.progress(80)
-
-                # ── Phase B · Step 5: Rank ─────────────────────────────────
-                status.text("🏆 Step 5/5: Ranking pre-loaded job matches…")
-                from src.ranker import rank_jobs
-                from src.adaptive_learning import AdaptiveLearner
-
-                if st.session_state.adaptive is None:
-                    st.session_state.adaptive = AdaptiveLearner()
-
-                ranked = rank_jobs(
-                    live_df, profile,
-                    hybrid_candidates,
-                    weights=st.session_state.adaptive.weights,
-                    feedback=st.session_state.feedback,
-                )
-                st.session_state.ranked_jobs    = ranked
-                st.session_state.pipeline_ready = True
-                progress.progress(100)
-
-                uid = st.session_state.current_user
-                if uid and ranked:
-                    save_job_list(uid, ranked)
-
-                from src.analytics import get_full_analytics
-                st.session_state.analytics = get_full_analytics(training_df, profile)
-
-                from src.ranker import benchmark_ranking
-                from src.embeddings import benchmark_retrieval
-                st.session_state.benchmark_data = {
-                    "retrieval": benchmark_retrieval(
-                        profile, training_df, index, training_job_ids,
-                        cluster_labels=cluster_labels,
-                    ),
-                    "ranking": benchmark_ranking(
-                        live_df, profile, hybrid_candidates, tfidf_candidates
-                    ),
-                }
-
-                status.empty()
-                st.success(
-                    f"✅ Pipeline complete! "
-                    f"**{len(ranked)} matches** from **{len(jsearch_df):,} pre-fetched JSearch jobs** · "
-                    f"Trained on **{len(training_df):,} Kaggle jobs** · "
-                    f"No API call at runtime."
-                )
-                time.sleep(0.5)
-                st.session_state.page = "🎯 Job Matches"
-                st.rerun()
-                return
-
-            # ══════════════════════════════════════════════════════════════════
-            # STANDARD BRANCH — Kaggle/Sample training + JSearch live pool
-            # ══════════════════════════════════════════════════════════════════
-
-            # ── Phase A · Step 1: Load training corpus (Kaggle / sample) ──
-            status.text("📥 Step 1/5: Loading Kaggle training corpus...")
-            from src.clean import load_clean_data
-
-            use_sample  = "Sample" in data_source
-            training_df = load_clean_data(sample=use_sample)
-
-            # If the sample corpus is below 5,000 pre-dedup records, escalate
-            # automatically to the full Kaggle dataset rather than padding with
-            # synthetic data.
-            if len(training_df) < 5_000 and use_sample:
-                logger.info(
-                    f"Sample corpus has {len(training_df):,} rows — escalating to "
-                    f"full Kaggle dataset to meet 5,000 pre-dedup minimum."
-                )
-                status.text("📥 Step 1/5: Sample too small — loading full Kaggle corpus…")
-                training_df = load_clean_data(sample=False)
-
-            # Snapshot BEFORE dedup — every cleaned record, used for download
-            st.session_state.full_corpus_df = training_df.copy()
-            progress.progress(15)
-
-            # ── Phase A · Step 2: Dedup training corpus ────────────────────
-            status.text("🔍 Step 2/5: Deduplicating training corpus (MinHash LSH)...")
             from src.dedupe import full_deduplication
-            training_df, dedup_stats = full_deduplication(training_df)
-            st.session_state.data_stats = dedup_stats
-            progress.progress(30)
-
-            # ── Phase A · Step 3: FAISS index + K-Means clusters ──────────
-            status.text("🧠 Step 3/5: Building embedding index + job-family clusters...")
             from src.embeddings import (
                 load_or_build_index, build_job_clusters, get_cluster_labels,
                 embed_and_score_live_jobs, tfidf_retrieve,
             )
-            # Filter to embeddable records only for FAISS; full df kept for download
+            from src.ranker import rank_jobs
+            from src.adaptive_learning import AdaptiveLearner
+
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 1: Load source corpus
+            # ─────────────────────────────────────────────────────────────────
+            kaggle_df = st.session_state.preloaded_kaggle_df
+
+            if (use_preloaded or use_sample) and kaggle_df is None:
+                status.empty(); progress.empty()
+                st.error(
+                    "❌ Kaggle corpus not found on disk. "
+                    "Make sure `data/preloaded_kaggle_50k.parquet` is in the repo."
+                )
+                return
+
+            if use_sample:
+                n_sample  = min(2_000, len(kaggle_df))
+                source_df = kaggle_df.sample(n=n_sample, random_state=42).copy()
+                status.text(f"📥 Step 1/5: Sampled {n_sample:,} rows from Kaggle parquet…")
+            elif use_preloaded:
+                source_df = kaggle_df.copy()
+                status.text(
+                    f"📥 Step 1/5: Loading Kaggle corpus ({len(source_df):,} rows)…"
+                )
+            else:
+                # Live JSearch — still use Kaggle parquet for Phase A training
+                if kaggle_df is not None:
+                    source_df = kaggle_df.copy()
+                    status.text(
+                        f"📥 Step 1/5: Loading Kaggle training corpus ({len(source_df):,} rows)…"
+                    )
+                else:
+                    # Fallback: load from CSV/parquet via clean.py
+                    from src.clean import load_clean_data
+                    source_df = load_clean_data(sample=False)
+                    status.text("📥 Step 1/5: Loading Kaggle training corpus…")
+
+            if "job_id" not in source_df.columns:
+                source_df["job_id"] = source_df.index.astype(str) + "_kaggle"
+            source_df = source_df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
+
+            # Snapshot BEFORE dedup (used for analytics download)
+            st.session_state.full_corpus_df = source_df.copy()
+            progress.progress(15)
+
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 2: Dedup
+            # ─────────────────────────────────────────────────────────────────
+            status.text("🔍 Step 2/5: Deduplicating corpus (MinHash LSH)…")
+            training_df, dedup_stats = full_deduplication(source_df)
+            st.session_state.data_stats = dedup_stats
+            progress.progress(30)
+
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 3: FAISS index + K-Means
+            # ─────────────────────────────────────────────────────────────────
+            status.text("🧠 Step 3/5: Building embedding index + job-family clusters…")
             if "embeddable" in training_df.columns:
                 embeddable_df = training_df[training_df["embeddable"] == True].copy()
-                n_non_emb = len(training_df) - len(embeddable_df)
-                if n_non_emb > 0:
-                    logger.info(
-                        f"Excluded {n_non_emb:,} non-embeddable rows from FAISS "
-                        f"(kept in download dataset)"
-                    )
             else:
                 embeddable_df = training_df.copy()
-            index, embeddings, training_job_ids = load_or_build_index(embeddable_df)
 
-            # Store training artefacts — used by benchmarks and analytics
+            index, embeddings, training_job_ids = load_or_build_index(embeddable_df)
             st.session_state.faiss_index = index
             st.session_state.job_ids     = training_job_ids
-            st.session_state.jobs_df     = training_df  # deduped — used for FAISS + scoring
+            st.session_state.jobs_df     = training_df
 
             cluster_labels = get_cluster_labels(training_job_ids)
             if cluster_labels is None:
@@ -1235,51 +1243,56 @@ def _run_full_pipeline(data_source: str, live_queries: str):
             st.session_state.cluster_labels = cluster_labels
             progress.progress(50)
 
-            # ── Phase B · Step 4: Fetch live jobs + score with trained model
-            status.text("🌐 Step 4/5: Fetching live jobs from JSearch & scoring...")
-            from src.ingest import fetch_multiple_queries
-            from src.clean import clean_jobs
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 4: Build match pool
+            # ─────────────────────────────────────────────────────────────────
+            if use_jsearch:
+                # ── Live JSearch path ─────────────────────────────────────
+                status.text("🌐 Step 4/5: Fetching live jobs from JSearch…")
+                from src.ingest import fetch_multiple_queries
+                from src.clean import clean_jobs
 
-            if not JSEARCH_API_KEY:
-                status.empty(); progress.empty()
-                st.error(
-                    "❌ **JSearch API key required.** "
-                    "Add `JSEARCH_API_KEY` to your Streamlit Secrets to fetch live jobs."
-                )
-                return
+                if not JSEARCH_API_KEY:
+                    status.empty(); progress.empty()
+                    st.error(
+                        "❌ **JSearch API key required.** "
+                        "Add `JSEARCH_API_KEY` to your Streamlit Secrets."
+                    )
+                    return
 
-            queries = [q.strip() for q in live_queries.split(",") if q.strip()]
-            if not queries:
-                queries = profile.get("target_roles", ["data scientist"])[:3]
+                queries = [q.strip() for q in live_queries.split(",") if q.strip()]
+                if not queries:
+                    queries = profile.get("target_roles", ["data scientist"])[:3]
 
-            live_raw = fetch_multiple_queries(queries, pages_per_query=3)
+                live_raw = fetch_multiple_queries(queries, pages_per_query=3)
 
-            # Guarantee at least 5,000 pre-dedup records by broadening with
-            # fallback queries if the role-specific fetch came up short.
-            if len(live_raw) < 5_000:
-                from src.ingest import broaden_jsearch_to_min
+                if live_raw.empty:
+                    status.empty(); progress.empty()
+                    st.error(
+                        "❌ No live jobs returned from JSearch. "
+                        "Check your API key and try different search queries."
+                    )
+                    return
+
+                live_df = clean_jobs(live_raw, save=False)
+                live_df = live_df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
+                st.session_state.live_jobs_df = live_df
+                st.toast(f"✅ Fetched {len(live_df):,} live jobs from JSearch")
+
+            else:
+                # ── Kaggle / Sample path — corpus IS the match pool ───────
                 status.text(
-                    f"🔍 Step 4/5: Pool has {len(live_raw):,} records — broadening "
-                    f"search to reach 5,000 pre-dedup minimum…"
+                    f"🎯 Step 4/5: Preparing {len(training_df):,} Kaggle jobs as match pool…"
                 )
-                live_raw = broaden_jsearch_to_min(live_raw, min_rows=5_000)
+                live_df = training_df.copy().drop_duplicates(subset=["job_id"]).reset_index(drop=True)
+                st.session_state.live_jobs_df = live_df
+                st.toast(f"✅ {len(live_df):,} Kaggle jobs ready as match pool")
 
-            if live_raw.empty:
-                status.empty(); progress.empty()
-                st.error(
-                    "❌ No live jobs returned from JSearch. "
-                    "Check your API key and try different search queries."
-                )
-                return
-
-            live_df = clean_jobs(live_raw, save=False)
-            live_df = live_df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
-            st.session_state.live_jobs_df = live_df
-            st.toast(f"✅ Fetched {len(live_df):,} live jobs from JSearch")
-
-            # Derive preferred / avoided job families from feedback on prior live sessions
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 4b: Embed + score match pool
+            # ─────────────────────────────────────────────────────────────────
             preferred_clusters, avoided_clusters = set(), set()
-            live_cluster_map = st.session_state.live_cluster_map
+            live_cluster_map = st.session_state.live_cluster_map or {}
             if st.session_state.feedback and live_cluster_map:
                 pos_counts: dict[int, int] = {}
                 neg_counts: dict[int, int] = {}
@@ -1294,30 +1307,59 @@ def _run_full_pipeline(data_source: str, live_queries: str):
                 preferred_clusters = {c for c, n in pos_counts.items() if n >= 2}
                 avoided_clusters   = {c for c, n in neg_counts.items() if n >= 2} - preferred_clusters
 
-            # Embed live jobs using trained model; cluster-boost from learned preferences
-            hybrid_candidates, new_cluster_map = embed_and_score_live_jobs(
+            dense_candidates, new_cluster_map, job_embs, profile_emb = embed_and_score_live_jobs(
                 profile, live_df,
                 preferred_clusters=preferred_clusters,
                 avoided_clusters=avoided_clusters,
+                retrieval_mode=retrieval_mode,
             )
-            st.session_state.live_cluster_map  = {**live_cluster_map, **new_cluster_map}
-            st.session_state.hybrid_candidates = hybrid_candidates
-            st.session_state.emb_candidates    = hybrid_candidates  # same source
+            st.session_state.live_cluster_map = {**live_cluster_map, **new_cluster_map}
 
-            # TF-IDF over live pool only — for benchmarking comparison
-            tfidf_candidates = tfidf_retrieve(profile, live_df,
-                                              k=min(RETRIEVAL_K, len(live_df)))
+            # TF-IDF retrieval — always computed for benchmarking; merged only in hybrid mode
+            tfidf_candidates = tfidf_retrieve(profile, live_df, k=min(RETRIEVAL_K, len(live_df)))
             st.session_state.tfidf_candidates = tfidf_candidates
+
+            if retrieval_mode == "hybrid":
+                # RRF merge: dense + tfidf
+                from src.embeddings import reciprocal_rank_fusion
+                try:
+                    hybrid_candidates = reciprocal_rank_fusion(dense_candidates, tfidf_candidates)
+                except Exception:
+                    hybrid_candidates = dense_candidates  # graceful fallback
+            else:
+                hybrid_candidates = dense_candidates  # dense only
+
+            st.session_state.hybrid_candidates = hybrid_candidates
+            st.session_state.emb_candidates    = dense_candidates
+
+            # Store embeddings for feedback-impact visualisation
+            st.session_state.profile_emb = profile_emb
+            st.session_state.job_embs    = job_embs
+
             progress.progress(80)
 
-            # ── Phase B · Step 5: Rank live candidates ─────────────────────
-            status.text("🏆 Step 5/5: Ranking live job matches...")
-            from src.ranker import rank_jobs
-            from src.adaptive_learning import AdaptiveLearner
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 5: Rank
+            # ─────────────────────────────────────────────────────────────────
+            status.text("🏆 Step 5/5: Ranking job matches…")
 
             if st.session_state.adaptive is None:
                 st.session_state.adaptive = AdaptiveLearner()
 
+            # Snapshot BEFORE feedback adaptation — used in Benchmarks tab
+            ranked_pre = rank_jobs(
+                live_df, profile,
+                hybrid_candidates,
+                weights=None,           # default weights, no feedback
+                feedback={},
+            )
+            st.session_state.pre_feedback_top10 = [
+                {"rank": i + 1, "title": j.title, "company": j.company,
+                 "score": j.final_score, "job_id": j.job_id}
+                for i, j in enumerate(ranked_pre[:10])
+            ]
+
+            # Full ranking with adaptive weights + feedback
             ranked = rank_jobs(
                 live_df, profile,
                 hybrid_candidates,
@@ -1326,18 +1368,22 @@ def _run_full_pipeline(data_source: str, live_queries: str):
             )
             st.session_state.ranked_jobs    = ranked
             st.session_state.pipeline_ready = True
+            st.session_state.retrieval_mode = retrieval_mode
             progress.progress(100)
 
-            # Auto-save the job list so the profile tab can display it later
+            # Auto-save job list to SQLite
             uid = st.session_state.current_user
             if uid and ranked:
                 save_job_list(uid, ranked)
 
-            # Analytics — on training corpus (represents full market landscape)
+            # Save results to per-profile in-memory cache
+            _save_to_profile_cache()
+
+            # Analytics
             from src.analytics import get_full_analytics
             st.session_state.analytics = get_full_analytics(training_df, profile)
 
-            # Benchmarks — retrieval on training corpus, ranking on live pool
+            # Benchmarks
             from src.ranker import benchmark_ranking
             from src.embeddings import benchmark_retrieval
             st.session_state.benchmark_data = {
@@ -1351,10 +1397,14 @@ def _run_full_pipeline(data_source: str, live_queries: str):
             }
 
             status.empty()
+            pool_label = (
+                f"{len(live_df):,} Kaggle jobs" if not use_jsearch
+                else f"{len(live_df):,} live JSearch jobs"
+            )
+            mode_label = "Dense FAISS" if retrieval_mode == "dense" else "Hybrid FAISS+TF-IDF"
             st.success(
-                f"✅ Pipeline complete! "
-                f"**{len(ranked)} live job matches** from **{len(live_df):,} live postings** · "
-                f"Trained on **{len(training_df):,} Kaggle jobs**."
+                f"✅ Pipeline complete! **{len(ranked)} matches** from **{pool_label}** · "
+                f"Retrieval: **{mode_label}** · Corpus: **{len(training_df):,} jobs after dedup**."
             )
             time.sleep(0.5)
             st.session_state.page = "🎯 Job Matches"
@@ -1421,29 +1471,33 @@ def page_matches():
     st.divider()
 
     # ── Data source banner ────────────────────────────────────────────────────
-    sources = {j.source for j in ranked}
-    live_count  = sum(1 for j in ranked if j.source == "jsearch")
-    synth_count = sum(1 for j in ranked if j.source == "synthetic")
-    kaggle_count = sum(1 for j in ranked if j.source == "kaggle")
+    live_count    = sum(1 for j in ranked if j.source == "jsearch")
+    kaggle_count  = sum(1 for j in ranked if j.source in ("kaggle", "preloaded"))
+    synth_count   = sum(1 for j in ranked if j.source == "synthetic")
+    training_size = len(st.session_state.jobs_df) if st.session_state.jobs_df is not None else 0
+    mode_label    = (
+        "Dense FAISS" if st.session_state.retrieval_mode == "dense"
+        else "Hybrid FAISS+TF-IDF"
+    )
 
     if synth_count > 0:
         st.warning(
-            f"⚠️ **{synth_count} synthetic jobs detected** in your results. "
-            f"This means JSearch returned fewer results than expected. "
-            f"Check that `JSEARCH_API_KEY` is set correctly in Streamlit Secrets.",
+            f"⚠️ **{synth_count} synthetic jobs detected.** "
+            "Check that `JSEARCH_API_KEY` is set correctly in Streamlit Secrets.",
             icon="⚠️",
         )
-    elif kaggle_count > 0:
-        st.warning(
-            f"⚠️ **{kaggle_count} Kaggle training jobs** appeared in results. "
-            f"These are not live postings — re-run the pipeline to refresh with JSearch.",
-            icon="⚠️",
+    elif live_count > 0:
+        st.success(
+            f"🟢 **{live_count} live JSearch matches** · "
+            f"Retrieval: **{mode_label}** · "
+            f"Trained on **{training_size:,} Kaggle jobs**.",
+            icon="✅",
         )
     else:
-        training_size = len(st.session_state.jobs_df) if st.session_state.jobs_df is not None else 0
         st.success(
-            f"🟢 **{live_count} live job matches** from JSearch API · "
-            f"Ranked using embeddings trained on **{training_size:,} Kaggle jobs**.",
+            f"🟢 **{len(ranked)} Kaggle corpus matches** · "
+            f"Retrieval: **{mode_label}** · "
+            f"Corpus: **{training_size:,} jobs after dedup**.",
             icon="✅",
         )
 
@@ -1941,8 +1995,9 @@ def page_benchmarks():
     bm  = st.session_state.benchmark_data
     ada = st.session_state.adaptive
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["🧠 Retrieval Comparison", "🏆 Ranking Pipeline", "🤖 Adaptive Learning", "✅ Persona Tests"]
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["🧠 Retrieval Comparison", "🏆 Ranking Pipeline", "🤖 Adaptive Learning",
+         "✅ Persona Tests", "🔄 Feedback Impact"]
     )
 
     # ── Retrieval benchmark ───────────────────────────────────────────────────
@@ -2120,6 +2175,186 @@ def page_benchmarks():
         if persona_results:
             st.dataframe(pd.DataFrame(persona_results), hide_index=True, use_container_width=True)
             st.info("Switch personas in Profile Setup to test each one.")
+
+    # ── Feedback Impact ───────────────────────────────────────────────────────
+    with tab5:
+        st.markdown("### 🔄 Feedback Impact on Job Rankings")
+        st.markdown("""
+        Shows how thumbs-up / thumbs-down feedback changed your top job matches
+        via **Thompson Sampling** weight adaptation and **cluster preference boosting**.
+        Also plots your profile's position in the job embedding space.
+        """)
+
+        pre_top10  = st.session_state.pre_feedback_top10
+        post_ranked = st.session_state.ranked_jobs
+        feedback   = st.session_state.feedback
+
+        if not pre_top10 or not post_ranked:
+            st.info("Run the pipeline and give at least one thumbs-up or thumbs-down to see feedback impact.")
+        else:
+            # ── Before / After table ─────────────────────────────────────────
+            st.markdown("#### Before vs After Feedback — Top 10 Jobs")
+            post_top10 = [
+                {"rank": i + 1, "title": j.title, "company": j.company,
+                 "score": j.final_score, "job_id": j.job_id}
+                for i, j in enumerate(post_ranked[:10])
+            ]
+
+            pre_ids  = [r["job_id"] for r in pre_top10]
+            post_ids = [r["job_id"] for r in post_top10]
+
+            rows = []
+            for i, post in enumerate(post_top10):
+                pre_rank = pre_ids.index(post["job_id"]) + 1 if post["job_id"] in pre_ids else None
+                fb_icon  = (
+                    "👍" if feedback.get(post["job_id"]) in ("good", "save")
+                    else "👎" if feedback.get(post["job_id"]) == "bad"
+                    else "—"
+                )
+                move = ""
+                if pre_rank is not None:
+                    delta = pre_rank - (i + 1)
+                    move = f"▲ +{delta}" if delta > 0 else (f"▼ {delta}" if delta < 0 else "═ 0")
+                else:
+                    move = "⭐ New"
+                rows.append({
+                    "Post Rank":    i + 1,
+                    "Pre Rank":     pre_rank if pre_rank else "—",
+                    "Moved":        move,
+                    "Feedback":     fb_icon,
+                    "Title":        post["title"][:55],
+                    "Company":      post["company"][:30],
+                    "Score (Post)": f"{post['score']:.3f}",
+                })
+
+            diff_df = pd.DataFrame(rows)
+            st.dataframe(diff_df, hide_index=True, use_container_width=True)
+
+            n_new = sum(1 for r in post_top10 if r["job_id"] not in pre_ids)
+            n_moved_up = sum(1 for r in rows if isinstance(r["Moved"], str) and r["Moved"].startswith("▲"))
+            st.caption(
+                f"**{n_new}** new entries entered the top 10 · "
+                f"**{n_moved_up}** positions moved upward from pre-feedback ranking"
+            )
+
+            # ── PCA scatter of job embeddings + profile vector ───────────────
+            st.markdown("#### Profile & Job Position Vectors (PCA Projection)")
+            st.markdown("""
+            Each point = one job in the match pool, projected to 2D via PCA.
+            Your profile vector is plotted at ⭐. Jobs you liked (👍) are green,
+            jobs you disliked (👎) are red, unrated jobs are grey.
+            Your profile should cluster near your liked jobs after feedback.
+            """)
+
+            profile_emb = st.session_state.profile_emb
+            job_embs    = st.session_state.job_embs
+            live_df     = st.session_state.live_jobs_df
+
+            if profile_emb is not None and job_embs is not None and live_df is not None and len(job_embs) > 0:
+                try:
+                    from sklearn.decomposition import PCA
+                    import plotly.graph_objects as go
+
+                    # Limit to at most 3000 points for rendering speed
+                    MAX_PLOT = 3_000
+                    job_ids_plot = live_df["job_id"].tolist()
+                    if len(job_embs) > MAX_PLOT:
+                        idx = np.random.choice(len(job_embs), MAX_PLOT, replace=False)
+                        embs_sub = job_embs[idx]
+                        ids_sub  = [job_ids_plot[i] for i in idx]
+                        titles_sub = live_df["title"].tolist()
+                        titles_sub = [titles_sub[i] for i in idx]
+                    else:
+                        embs_sub   = job_embs
+                        ids_sub    = job_ids_plot
+                        titles_sub = live_df["title"].tolist()
+
+                    # Stack profile + jobs for joint PCA
+                    all_embs = np.vstack([profile_emb.reshape(1, -1), embs_sub])
+                    pca = PCA(n_components=2, random_state=42)
+                    coords = pca.fit_transform(all_embs)
+                    profile_xy = coords[0]
+                    job_coords = coords[1:]
+
+                    fig = go.Figure()
+
+                    # Build boolean masks for each feedback category
+                    liked_mask    = np.array([feedback.get(jid) in ("good", "save") for jid in ids_sub])
+                    disliked_mask = np.array([feedback.get(jid) == "bad"            for jid in ids_sub])
+                    unrated_mask  = ~liked_mask & ~disliked_mask
+
+                    # Unrated jobs (grey, smaller)
+                    if unrated_mask.any():
+                        fig.add_trace(go.Scatter(
+                            x=job_coords[unrated_mask, 0],
+                            y=job_coords[unrated_mask, 1],
+                            mode="markers",
+                            name="Unrated",
+                            marker=dict(color="#aab7c4", size=5, opacity=0.55),
+                            text=[titles_sub[i] for i, m in enumerate(unrated_mask) if m],
+                            hovertemplate="%{text}<extra>unrated</extra>",
+                        ))
+
+                    # Liked jobs
+                    if liked_mask.any():
+                        fig.add_trace(go.Scatter(
+                            x=job_coords[liked_mask, 0],
+                            y=job_coords[liked_mask, 1],
+                            mode="markers",
+                            name="👍 Liked",
+                            marker=dict(color="#27ae60", size=10, symbol="circle",
+                                        line=dict(width=1, color="white")),
+                            text=[titles_sub[i] for i, m in enumerate(liked_mask) if m],
+                            hovertemplate="%{text}<extra>liked</extra>",
+                        ))
+
+                    # Disliked jobs
+                    if disliked_mask.any():
+                        fig.add_trace(go.Scatter(
+                            x=job_coords[disliked_mask, 0],
+                            y=job_coords[disliked_mask, 1],
+                            mode="markers",
+                            name="👎 Disliked",
+                            marker=dict(color="#e74c3c", size=10, symbol="x",
+                                        line=dict(width=1, color="white")),
+                            text=[titles_sub[i] for i, m in enumerate(disliked_mask) if m],
+                            hovertemplate="%{text}<extra>disliked</extra>",
+                        ))
+
+                    # Profile vector star
+                    fig.add_trace(go.Scatter(
+                        x=[profile_xy[0]],
+                        y=[profile_xy[1]],
+                        mode="markers+text",
+                        name="⭐ Your Profile",
+                        marker=dict(color="#f1c40f", size=22, symbol="star",
+                                    line=dict(width=2, color="#333")),
+                        text=["⭐ You"],
+                        textposition="top center",
+                        hovertemplate="Your profile vector<extra></extra>",
+                    ))
+
+                    explained = pca.explained_variance_ratio_
+                    fig.update_layout(
+                        title=f"Job Embedding Space (PCA · PC1={explained[0]:.1%}, PC2={explained[1]:.1%})",
+                        xaxis_title=f"PC1 ({explained[0]:.1%} variance)",
+                        yaxis_title=f"PC2 ({explained[1]:.1%} variance)",
+                        plot_bgcolor="white",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+                        height=520,
+                        margin=dict(l=0, r=0, t=60, b=0),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        f"Showing {len(ids_sub):,} of {len(job_embs):,} jobs. "
+                        f"Profile vector proximity to liked (green) jobs validates semantic alignment."
+                    )
+                except ImportError:
+                    st.warning("Install scikit-learn (`pip install scikit-learn`) to enable the PCA plot.")
+                except Exception as exc:
+                    st.warning(f"PCA plot skipped: {exc}")
+            else:
+                st.info("Re-run the pipeline to generate embedding vectors for this visualisation.")
 
     # ── Deduplication stats ───────────────────────────────────────────────────
     if st.session_state.data_stats:
