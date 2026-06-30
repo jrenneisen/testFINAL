@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 adaptive_learning.py — Adaptive ranking improvement from user feedback.
 

@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 resume_generator.py — AI-powered tailored resume generation using OpenAI GPT-4o-mini.
 

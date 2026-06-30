@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 storage.py — Persistent SQLite storage for JobPilot user profiles, feedback,
              bandit state, ranking weights, and generated resumes.
@@ -119,11 +120,26 @@ def init_db():
                 PRIMARY KEY (user_id, key)
             );
 
+            -- Live JSearch jobs — shared across all users, persisted between sessions.
+            -- Full row stored as JSON so any schema survives cleanly.
+            -- source is always 'jsearch'; fetched_at records when the row was added.
+            CREATE TABLE IF NOT EXISTS jsearch_jobs (
+                job_id      TEXT PRIMARY KEY,
+                title       TEXT,
+                company     TEXT,
+                location    TEXT,
+                source      TEXT DEFAULT 'jsearch',
+                fetched_at  TEXT DEFAULT (datetime('now')),
+                data_json   TEXT NOT NULL
+            );
+
             -- Indexes for common query patterns
             CREATE INDEX IF NOT EXISTS idx_feedback_user
                 ON feedback(user_id, recorded_at DESC);
             CREATE INDEX IF NOT EXISTS idx_feedback_job
                 ON feedback(user_id, job_id);
+            CREATE INDEX IF NOT EXISTS idx_jsearch_fetched
+                ON jsearch_jobs(fetched_at DESC);
         """)
     logger.info(f"Database ready: {DB_PATH}")
 
@@ -534,6 +550,98 @@ def load_job_list(user_id: str) -> list[dict]:
         for j in jobs:
             j["_saved_at"] = row["updated_at"]
         return jobs
+
+
+# ─── JSearch job persistence ─────────────────────────────────────────────────
+def save_jsearch_jobs(df: "pd.DataFrame") -> int:
+    """
+    Upsert JSearch job rows into the jsearch_jobs table.
+    Each row is stored as a JSON blob so the full schema is preserved.
+    Returns the number of NEW rows inserted (existing job_ids are skipped).
+
+    Call this immediately after fetching + cleaning JSearch results so jobs
+    survive session restarts and are available to all users on the same server.
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        return 0
+
+    existing_ids = get_jsearch_job_ids()
+    new_rows = df[~df["job_id"].isin(existing_ids)]
+    if new_rows.empty:
+        logger.info("save_jsearch_jobs: all rows already present — nothing inserted")
+        return 0
+
+    records = []
+    for _, row in new_rows.iterrows():
+        row_dict = row.to_dict()
+        # Convert non-JSON-serialisable types
+        for k, v in row_dict.items():
+            if hasattr(v, "item"):          # numpy scalar → python
+                row_dict[k] = v.item()
+            elif hasattr(v, "isoformat"):   # datetime → str
+                row_dict[k] = v.isoformat()
+            elif isinstance(v, list):
+                row_dict[k] = v            # already serialisable
+        records.append((
+            str(row_dict.get("job_id", "")),
+            str(row_dict.get("title", "")),
+            str(row_dict.get("company", "")),
+            str(row_dict.get("location", "")),
+            "jsearch",
+            json.dumps(row_dict),
+        ))
+
+    with _get_conn() as conn:
+        conn.executemany("""
+            INSERT OR IGNORE INTO jsearch_jobs
+                (job_id, title, company, location, source, fetched_at, data_json)
+            VALUES (?, ?, ?, ?, ?, datetime('now'), ?)
+        """, records)
+
+    logger.info(f"save_jsearch_jobs: inserted {len(records)} new rows")
+    return len(records)
+
+
+def load_jsearch_jobs() -> "pd.DataFrame":
+    """
+    Load all persisted JSearch jobs as a DataFrame.
+    Returns an empty DataFrame (not None) if no jobs have been saved yet.
+    The full row schema is reconstructed from the stored JSON.
+    """
+    import pandas as pd
+
+    with _get_conn() as conn:
+        rows = conn.execute(
+            "SELECT data_json FROM jsearch_jobs ORDER BY fetched_at DESC"
+        ).fetchall()
+
+    if not rows:
+        return pd.DataFrame()
+
+    records = [json.loads(r["data_json"]) for r in rows]
+    df = pd.DataFrame(records)
+
+    # Ensure source tag is correct
+    df["source"] = "jsearch"
+
+    logger.info(f"load_jsearch_jobs: loaded {len(df):,} rows from DB")
+    return df
+
+
+def count_jsearch_jobs() -> int:
+    """Return the number of JSearch jobs currently stored in the DB."""
+    with _get_conn() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM jsearch_jobs").fetchone()
+        return row["n"] if row else 0
+
+
+def get_jsearch_job_ids() -> set:
+    """Return the set of all job_ids currently in the jsearch_jobs table."""
+    with _get_conn() as conn:
+        rows = conn.execute("SELECT job_id FROM jsearch_jobs").fetchall()
+        return {r["job_id"] for r in rows}
 
 
 # ─── Utility ──────────────────────────────────────────────────────────────────

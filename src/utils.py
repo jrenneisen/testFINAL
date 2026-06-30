@@ -24,10 +24,17 @@ OUTPUTS_DIR     = ROOT_DIR / "outputs"
 RAW_CSV         = DATA_DIR / "raw_jobs.csv"
 CLEAN_PARQUET   = DATA_DIR / "jobs_clean.parquet"
 SAMPLE_PARQUET  = DATA_DIR / "jobs_sample.parquet"
+# ── Legacy paths (kept for backward-compat; not shipped in v10+) ──────────────
 FAISS_INDEX     = DATA_DIR / "faiss_index.bin"
 EMBEDDINGS_FILE = DATA_DIR / "embeddings.npy"
 JOB_IDS_FILE    = DATA_DIR / "job_ids.npy"
-CLUSTERS_FILE   = DATA_DIR / "job_clusters.npz"   # K-Means job family clusters
+
+# ── Shipped artifacts (what lives in data/ of the runnable folder) ─────────────
+VECTOR_INDEX_ZIP  = DATA_DIR / "vector_index.zip"   # int8 vectors + scale.json + job_ids
+JOB_META_PARQUET  = DATA_DIR / "job_meta.parquet"   # display/ranking metadata (no raw embed)
+CLUSTERS_FILE     = DATA_DIR / "job_clusters.npz"   # K-Means labels + centroids
+CLUSTER_STATE_FILE = DATA_DIR / "cluster_state.json" # rebuild timestamp + count
+
 PERSONAS_FILE   = DATA_DIR / "personas.json"
 
 DATA_DIR.mkdir(exist_ok=True)

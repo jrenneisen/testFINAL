@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 embeddings.py — Dense vector embeddings, FAISS ANN search, job clustering, and hybrid retrieval.
 
@@ -30,8 +31,16 @@ from sentence_transformers import SentenceTransformer
 
 from src.utils import (
     FAISS_INDEX, EMBEDDINGS_FILE, JOB_IDS_FILE, DATA_DIR,
+    VECTOR_INDEX_ZIP, JOB_META_PARQUET, CLUSTERS_FILE, CLUSTER_STATE_FILE,
     logger, RETRIEVAL_K
 )
+
+# ── JSearch companion files (separate from the Kaggle pre-built index) ────────
+# Kaggle index files (FAISS_INDEX / EMBEDDINGS_FILE / JOB_IDS_FILE) are built
+# once offline and committed to the repo — they never change at runtime.
+# JSearch embeddings are accumulated here as users refresh live data.
+JSEARCH_EMBEDDINGS_FILE = DATA_DIR / "jsearch_embeddings.npy"
+JSEARCH_JOB_IDS_FILE    = DATA_DIR / "jsearch_job_ids.npy"
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 CLUSTERS_FILE = DATA_DIR / "job_clusters.npz"
@@ -91,11 +100,20 @@ def build_job_text(row: pd.Series | dict) -> str:
       in the profile matches "Senior" level jobs more consistently.
     - Description is capped at 600 chars — longer descriptions add noise not signal.
     """
-    skills = row.get("skills_extracted", []) or []
-    if isinstance(skills, str):
+    skills = row.get("skills_extracted", None)
+    if skills is None:
+        skills = []
+    elif hasattr(skills, "tolist"):          # numpy array
+        skills = skills.tolist()
+    elif isinstance(skills, str):
         import ast
         try:
             skills = ast.literal_eval(skills)
+        except Exception:
+            skills = []
+    elif not isinstance(skills, list):
+        try:
+            skills = list(skills)
         except Exception:
             skills = []
 
@@ -201,6 +219,234 @@ def build_profile_text(profile: dict) -> str:
         f"{trajectory} "
         f"[RESUME] {resume_text}"
     )
+
+
+# ─── Int8 Quantized Index (primary shipped format) ────────────────────────────
+# Vectors are quantized to int8 at build time, stored in vector_index.zip.
+# The zip is the single source of truth for base-corpus vectors.
+# At load time they are de-quantized to float32 and the FAISS index is rebuilt
+# in memory — no need to ship the ~77 MB faiss_index.bin or embeddings.npy.
+#
+# Quantization details:
+#   symmetric, global scale: scale = max(|v|) / 127
+#   quantize : q = round(v / scale).clip(-127, 127).astype(int8)
+#   dequantize: v ≈ q.astype(float32) * scale  [then re-normalize]
+#   Expected recall@10: ~96-99% vs exact float32 for L2-normalized 384-dim vectors.
+
+INT8_MAX = 127
+
+
+def quantize_int8(vectors: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Symmetrically quantize a float32 (N, D) matrix to int8.
+    Returns (quantized_int8, scale) where scale is a single float scalar.
+    """
+    scale = float(np.abs(vectors).max()) / INT8_MAX
+    if scale == 0:
+        scale = 1e-8
+    q = np.round(vectors / scale).clip(-INT8_MAX, INT8_MAX).astype(np.int8)
+    return q, scale
+
+
+def dequantize_int8(q: np.ndarray, scale: float) -> np.ndarray:
+    """
+    Restore float32 vectors from int8 quantization.
+    Re-normalizes rows to unit L2 norm to restore inner-product == cosine property.
+    """
+    v = q.astype(np.float32) * scale
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    return (v / norms).astype(np.float32)
+
+
+def load_quantized_index(zip_path: Path | None = None) -> tuple[faiss.Index, np.ndarray, list[str]]:
+    """
+    Load the int8-quantized vector index from vector_index.zip.
+
+    Opens the zip in memory (no disk extraction), reads:
+      embeddings_int8.npy  — shape (N, 384) int8
+      scale.json           — {"scale": float, "dim": int, "count": int}
+      job_ids.npy          — shape (N,) string
+
+    De-quantizes to float32, re-normalizes, builds FAISS IndexFlatIP.
+    Returns (index, embeddings_float32, job_ids_list).
+    """
+    import zipfile, json
+
+    path = zip_path or VECTOR_INDEX_ZIP
+    if not path.exists():
+        raise FileNotFoundError(
+            f"vector_index.zip not found at {path}. "
+            "Run: python scripts/build_preloaded_data.py --force"
+        )
+
+    logger.info(f"Loading quantized index from {path.name} …")
+    t0 = time.time()
+
+    with zipfile.ZipFile(path, "r") as zf:
+        with zf.open("scale.json") as f:
+            meta  = json.load(f)
+        scale = float(meta["scale"])
+
+        with zf.open("embeddings_int8.npy") as f:
+            q = np.load(f)
+
+        with zf.open("job_ids.npy") as f:
+            job_ids = np.load(f, allow_pickle=True).tolist()
+
+    embeddings = dequantize_int8(q, scale)
+
+    dim   = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+
+    logger.info(
+        f"Quantized index loaded: {index.ntotal:,} vectors "
+        f"(scale={scale:.6f}) in {time.time()-t0:.1f}s"
+    )
+    return index, embeddings, job_ids
+
+
+def prebuilt_index_exists() -> bool:
+    """
+    True when the shipped vector_index.zip is present.
+    Falls back to legacy faiss_index.bin for backward-compat.
+    """
+    return VECTOR_INDEX_ZIP.exists() or FAISS_INDEX.exists()
+
+
+def load_prebuilt_index() -> tuple[faiss.Index, np.ndarray, list[str]]:
+    """
+    Load the pre-built index — prefers the compact quantized zip,
+    falls back to legacy float32 .bin/.npy if zip not present.
+    """
+    if VECTOR_INDEX_ZIP.exists():
+        return load_quantized_index()
+    if FAISS_INDEX.exists() and EMBEDDINGS_FILE.exists():
+        logger.warning("vector_index.zip not found — falling back to legacy faiss_index.bin")
+        return _load_index()
+    raise FileNotFoundError(
+        "No pre-built index found. "
+        "Run: python scripts/build_preloaded_data.py --force"
+    )
+
+
+# ─── Periodic cluster rebuild ──────────────────────────────────────────────────
+CLUSTER_REBUILD_GROWTH_THRESHOLD = 0.25   # rebuild if live pool grew ≥25% since last build
+CLUSTER_REBUILD_DAYS_THRESHOLD   = 7      # rebuild if ≥7 days since last build
+
+
+def maybe_rebuild_clusters(force: bool = False) -> bool:
+    """
+    Rebuild K-Means job-family clusters when growth or time thresholds are met.
+
+    Thresholds (constants above, easy to tune):
+      - ≥25% growth in the combined base+live pool since last rebuild, OR
+      - ≥7 days since the last rebuild.
+
+    On trigger: loads base vectors (from FAISS via reconstruct_n) + live JSearch
+    vectors, concatenates them, re-runs K-Means, atomically replaces job_clusters.npz
+    and cluster_state.json.
+
+    Returns True if a rebuild was triggered, False if thresholds not met (no-op).
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    # ── Load cluster state ────────────────────────────────────────────────────
+    state: dict = {}
+    if CLUSTER_STATE_FILE.exists():
+        try:
+            state = _json.loads(CLUSTER_STATE_FILE.read_text())
+        except Exception:
+            state = {}
+
+    last_ts  = state.get("last_build_ts", "")
+    n_at_last = int(state.get("n_at_last_build", 0))
+
+    # ── Current combined pool size ────────────────────────────────────────────
+    n_base = 0
+    base_embeddings = None
+    if VECTOR_INDEX_ZIP.exists():
+        try:
+            _, base_embeddings, base_ids = load_quantized_index()
+            n_base = len(base_ids)
+        except Exception:
+            pass
+
+    js_vecs, js_ids = load_jsearch_embeddings()
+    n_live = len(js_ids) if js_ids else 0
+    n_total = n_base + n_live
+
+    # ── Check thresholds ──────────────────────────────────────────────────────
+    needs_rebuild = force
+
+    if not needs_rebuild and n_at_last > 0:
+        growth = (n_total - n_at_last) / n_at_last
+        if growth >= CLUSTER_REBUILD_GROWTH_THRESHOLD:
+            logger.info(f"Cluster rebuild triggered: pool grew {growth:.1%} (threshold {CLUSTER_REBUILD_GROWTH_THRESHOLD:.0%})")
+            needs_rebuild = True
+
+    if not needs_rebuild and last_ts:
+        try:
+            last_dt  = datetime.fromisoformat(last_ts)
+            days_old = (datetime.now(timezone.utc) - last_dt).days
+            if days_old >= CLUSTER_REBUILD_DAYS_THRESHOLD:
+                logger.info(f"Cluster rebuild triggered: {days_old} days since last build (threshold {CLUSTER_REBUILD_DAYS_THRESHOLD})")
+                needs_rebuild = True
+        except Exception:
+            needs_rebuild = True  # corrupt timestamp → rebuild to be safe
+
+    if not needs_rebuild:
+        logger.info(f"Cluster rebuild skipped: pool={n_total:,}, last_n={n_at_last:,}, last_ts={last_ts}")
+        return False
+
+    # ── Rebuild ───────────────────────────────────────────────────────────────
+    if base_embeddings is None:
+        logger.warning("Cannot rebuild clusters: base vectors unavailable")
+        return False
+
+    if js_vecs is not None and len(js_ids) > 0:
+        combined_vecs = np.vstack([base_embeddings, js_vecs])
+        combined_ids  = (base_ids if 'base_ids' in dir() else []) + js_ids  # type: ignore[name-defined]
+    else:
+        combined_vecs = base_embeddings
+        combined_ids  = base_ids if 'base_ids' in dir() else []  # type: ignore[name-defined]
+
+    logger.info(f"Rebuilding K-Means clusters over {len(combined_vecs):,} vectors …")
+
+    # Atomic write: write to temp path then replace
+    tmp_path = CLUSTERS_FILE.with_suffix(".tmp.npz")
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+        kmeans = MiniBatchKMeans(
+            n_clusters=N_CLUSTERS, random_state=42,
+            batch_size=min(2048, len(combined_vecs)),
+            n_init=5, max_iter=150,
+        )
+        labels = kmeans.fit_predict(combined_vecs).astype(np.int32)
+        np.savez(
+            tmp_path,
+            labels=labels,
+            centers=kmeans.cluster_centers_.astype("float32"),
+            n_clusters=np.int32(N_CLUSTERS),
+            job_ids=np.array(combined_ids),
+        )
+        tmp_path.replace(CLUSTERS_FILE)
+        logger.info(f"Clusters rebuilt and saved: {N_CLUSTERS} families over {len(combined_vecs):,} jobs")
+    except Exception as exc:
+        logger.error(f"Cluster rebuild failed: {exc}")
+        if tmp_path.exists():
+            tmp_path.unlink()
+        return False
+
+    # Update state
+    new_state = {
+        "last_build_ts":   datetime.now(timezone.utc).isoformat(),
+        "n_at_last_build": n_total,
+    }
+    CLUSTER_STATE_FILE.write_text(_json.dumps(new_state, indent=2))
+    return True
 
 
 # ─── FAISS Index (build + persist + load) ─────────────────────────────────────
@@ -457,10 +703,53 @@ def retrieve_candidates(
 
 
 # ─── Sparse retrieval (TF-IDF) ────────────────────────────────────────────────
+
+def _build_tfidf(df: pd.DataFrame):
+    """
+    Pre-build the TF-IDF vectorizer and document matrix over a job corpus.
+
+    Called once at server startup by the @st.cache_resource wrapper in app.py.
+    The fitted vectorizer and matrix are cached in RAM so tfidf_retrieve()
+    can skip the fit step and just transform the profile query vector.
+
+    Returns (vectorizer, tfidf_matrix, job_ids_list):
+        vectorizer   — fitted TfidfVectorizer
+        tfidf_matrix — sparse (n_jobs, n_features) matrix
+        job_ids_list — list[str] aligned with tfidf_matrix rows
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+
+    job_texts = (
+        df["job_text_clean"].fillna("").tolist()
+        if "job_text_clean" in df.columns
+        else [build_job_text(r) for _, r in df.iterrows()]
+    )
+    job_ids_list = df["job_id"].tolist()
+
+    vectorizer = TfidfVectorizer(
+        max_features=15_000,
+        ngram_range=(1, 2),
+        min_df=2,
+        sublinear_tf=True,
+    )
+    tfidf_matrix = vectorizer.fit_transform(job_texts)
+    logger.info(
+        f"TF-IDF matrix built: {tfidf_matrix.shape[0]:,} docs × "
+        f"{tfidf_matrix.shape[1]:,} features"
+    )
+    return vectorizer, tfidf_matrix, job_ids_list
+
+
 def tfidf_retrieve(
     profile: dict,
     df: pd.DataFrame,
     k: int = RETRIEVAL_K,
+    # Optional pre-built objects from @st.cache_resource (Phase 1 warm-up).
+    # When provided the vectorizer fit step is skipped — only a transform()
+    # call is needed, taking <50ms instead of ~2s.
+    _vectorizer=None,
+    _tfidf_matrix=None,
+    _cached_job_ids: list[str] | None = None,
 ) -> list[tuple[str, float]]:
     """
     Sparse TF-IDF retrieval over the job corpus.
@@ -471,11 +760,27 @@ def tfidf_retrieve(
 
     Uses bigrams (ngram_range=(1,2)) and a 15k-feature vocabulary for
     better phrase matching (e.g., "machine learning" > "machine" ∩ "learning").
+
+    When _vectorizer/_tfidf_matrix/_cached_job_ids are supplied (passed from
+    the app.py Phase 1 cache), the fit step is skipped entirely — the profile
+    text is just transformed against the already-fitted vocabulary, making
+    repeated calls effectively free.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 
     profile_text = build_profile_text(profile)
+
+    if _vectorizer is not None and _tfidf_matrix is not None and _cached_job_ids is not None:
+        # ── Fast path: use pre-built objects from Phase 1 cache ──────────────
+        # Only transform the single profile query — no fit(), no corpus rebuild.
+        profile_vec  = _vectorizer.transform([profile_text])
+        job_vecs     = _tfidf_matrix
+        scores       = cosine_similarity(profile_vec, job_vecs)[0]
+        top_k_idx    = np.argsort(scores)[::-1][:k]
+        return [(_cached_job_ids[i], float(scores[i])) for i in top_k_idx]
+
+    # ── Slow path: fit from scratch (no pre-built cache available) ────────────
     job_texts    = (
         df["job_text_clean"].tolist()
         if "job_text_clean" in df.columns
@@ -713,3 +1018,74 @@ def embed_and_score_live_jobs(
 def load_or_build_index(df: pd.DataFrame, force_rebuild: bool = False):
     """Convenience wrapper used by app.py."""
     return build_faiss_index(df, force_rebuild=force_rebuild)
+
+
+def load_prebuilt_index() -> tuple[faiss.Index, np.ndarray, list[str]]:
+    """
+    Public fast-path loader: read FAISS index + embeddings + job_ids from disk.
+
+    Use this when pre-built artifacts are shipped with the repo (built by
+    scripts/build_preloaded_data.py).  Much faster than re-embedding at runtime:
+      - FAISS load: ~1-2s for 8k vectors
+      - No model call, no dedup, no MinHash
+
+    Raises FileNotFoundError if any required file is missing.
+    """
+    missing = [p for p in (FAISS_INDEX, EMBEDDINGS_FILE, JOB_IDS_FILE) if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Pre-built index files missing: {[str(p) for p in missing]}. "
+            "Run: python scripts/build_preloaded_data.py"
+        )
+    return _load_index()
+
+
+def prebuilt_index_exists() -> bool:
+    """Return True if all pre-built FAISS index files are present on disk."""
+    return all(p.exists() for p in (FAISS_INDEX, EMBEDDINGS_FILE, JOB_IDS_FILE))
+
+
+# ─── JSearch incremental embedding helpers ────────────────────────────────────
+
+def add_jsearch_embeddings(vectors: np.ndarray, job_ids: list[str]) -> None:
+    """
+    Append a new batch of JSearch embeddings to the on-disk companion files.
+
+    Called by _fetch_and_add_jsearch() in app.py after cleaning new JSearch
+    results.  The files grow incrementally — re-running adds only new rows.
+
+    Files written:
+      data/jsearch_embeddings.npy  — float32 (N_total × 384)
+      data/jsearch_job_ids.npy     — object array of job_id strings
+
+    Deduplication against existing IDs is handled by the caller (storage.py
+    get_jsearch_job_ids), so this function always appends unconditionally.
+    """
+    if JSEARCH_EMBEDDINGS_FILE.exists():
+        existing_vecs = np.load(str(JSEARCH_EMBEDDINGS_FILE))
+        existing_ids  = np.load(str(JSEARCH_JOB_IDS_FILE), allow_pickle=True).tolist()
+        vectors  = np.vstack([existing_vecs, vectors])
+        job_ids  = existing_ids + list(job_ids)
+
+    np.save(str(JSEARCH_EMBEDDINGS_FILE), vectors.astype("float32"))
+    np.save(str(JSEARCH_JOB_IDS_FILE),    np.array(job_ids, dtype=object))
+    logger.info(
+        f"add_jsearch_embeddings: {JSEARCH_EMBEDDINGS_FILE.name} now has "
+        f"{vectors.shape[0]:,} vectors"
+    )
+
+
+def load_jsearch_embeddings() -> tuple[np.ndarray | None, list[str]]:
+    """
+    Load the accumulated JSearch embeddings from disk.
+
+    Returns:
+        (vectors, job_ids)  — float32 (N×384) and list of job_id strings
+        (None, [])          — if no JSearch embeddings have been saved yet
+    """
+    if not JSEARCH_EMBEDDINGS_FILE.exists():
+        return None, []
+    vectors = np.load(str(JSEARCH_EMBEDDINGS_FILE))
+    job_ids = np.load(str(JSEARCH_JOB_IDS_FILE), allow_pickle=True).tolist()
+    logger.info(f"load_jsearch_embeddings: {len(job_ids):,} JSearch vectors loaded")
+    return vectors.astype("float32"), job_ids

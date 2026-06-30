@@ -1,485 +1,297 @@
 #!/usr/bin/env python3
 """
-build_preloaded_data.py — One-time builder for JobPilot pre-loaded datasets.
+build_preloaded_data.py — Offline build script for JobPilot shipped artifacts.
 
-Run this once from the project root.  It auto-reads your credentials from
-the same places the app does — no extra setup required:
+RUN ONCE on the author's machine before assembling the deliverable folder.
+Never runs at app startup.
 
-  • JSearch key  →  .streamlit/secrets.toml  OR  .env  OR  env var JSEARCH_API_KEY
-  • Kaggle creds →  ~/.kaggle/kaggle.json    OR  env vars KAGGLE_USERNAME + KAGGLE_KEY
+What this produces (into data/):
+  vector_index.zip  — int8-quantized vectors + scale.json + job_ids  (~16 MB)
+  job_meta.parquet  — display/ranking metadata with full descriptions (~10 MB)
+  job_clusters.npz  — K-Means labels + centroids (~1 MB)
 
-Output files (saved to data/ automatically):
-  data/preloaded_kaggle_50k.parquet   — Kaggle TechMap snapshot (training corpus)
-  data/preloaded_jsearch_50k.parquet  — JSearch job snapshot   (match pool)
+What it reads (on the author's machine, never shipped):
+  data/preloaded_kaggle_50k.parquet — 79 MB raw corpus, stays local only
 
 Usage:
-    python scripts/build_preloaded_data.py
+  python scripts/build_preloaded_data.py [--source PATH] [--force]
 
-The app auto-detects both files on startup and skips the upload step entirely.
-Re-run with --force to refresh the JSearch snapshot with newer postings.
+  --source  PATH  Path to source parquet (default: data/preloaded_kaggle_50k.parquet)
+  --force         Rebuild even if artifacts already exist
+  --kaggle-only   Alias for running only the Kaggle build (legacy flag, same as default)
 """
 
+from __future__ import annotations
+
 import sys
-import os
+import json
+import time
+import zipfile
 import argparse
 import logging
-import hashlib
+import tempfile
+import shutil
 from pathlib import Path
 
-# ── Locate project root regardless of where the script is called from ─────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
-import pandas as pd
-import numpy as np
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger(__name__)
+log = logging.getLogger("build")
 
-DATA_DIR    = PROJECT_ROOT / "data"
-TARGET_SIZE = 50_000
-DATA_DIR.mkdir(exist_ok=True)
+MAX_ARTIFACT_MB = 45.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AUTO-CREDENTIAL LOADING
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _load_jsearch_key() -> str:
-    """
-    Find the JSearch API key from any of the standard locations:
-      1. JSEARCH_API_KEY environment variable (already set)
-      2. .env file in the project root (loaded via python-dotenv)
-      3. .streamlit/secrets.toml in the project root (same file the app uses)
-    Returns the key string, or "" if not found.
-    """
-    # 1. Already in environment
-    key = os.environ.get("JSEARCH_API_KEY", "")
-    if key:
-        log.info("JSearch key loaded from environment variable.")
-        return key
-
-    # 2. .env file
-    env_file = PROJECT_ROOT / ".env"
-    if env_file.exists():
-        try:
-            from dotenv import load_dotenv
-            load_dotenv(env_file)
-            key = os.environ.get("JSEARCH_API_KEY", "")
-            if key:
-                log.info(f"JSearch key loaded from {env_file}.")
-                return key
-        except ImportError:
-            # Parse manually — no dotenv needed
-            for line in env_file.read_text().splitlines():
-                line = line.strip()
-                if line.startswith("JSEARCH_API_KEY"):
-                    key = line.split("=", 1)[-1].strip().strip('"').strip("'")
-                    if key:
-                        log.info(f"JSearch key loaded from {env_file} (manual parse).")
-                        return key
-
-    # 3. .streamlit/secrets.toml
-    secrets_file = PROJECT_ROOT / ".streamlit" / "secrets.toml"
-    if secrets_file.exists():
-        try:
-            import tomllib  # Python 3.11+
-        except ImportError:
-            try:
-                import tomli as tomllib  # pip install tomli
-            except ImportError:
-                tomllib = None
-
-        if tomllib:
-            try:
-                with open(secrets_file, "rb") as f:
-                    secrets = tomllib.load(f)
-                key = secrets.get("JSEARCH_API_KEY", "")
-                if key:
-                    log.info(f"JSearch key loaded from {secrets_file}.")
-                    return key
-            except Exception as e:
-                log.warning(f"Could not parse secrets.toml: {e}")
-        else:
-            # Fallback: grep for the key manually
-            for line in secrets_file.read_text().splitlines():
-                if "JSEARCH_API_KEY" in line:
-                    key = line.split("=", 1)[-1].strip().strip('"').strip("'")
-                    if key:
-                        log.info(f"JSearch key loaded from {secrets_file} (manual parse).")
-                        return key
-
-    return ""
-
-
-def _check_kaggle_creds() -> bool:
-    """
-    Return True if Kaggle credentials are available in any standard location.
-    kagglehub handles the actual auth — this just provides a helpful message.
-    """
-    kaggle_json = Path.home() / ".kaggle" / "kaggle.json"
-    if kaggle_json.exists():
-        log.info(f"Kaggle credentials found at {kaggle_json}.")
-        return True
-    if os.environ.get("KAGGLE_USERNAME") and os.environ.get("KAGGLE_KEY"):
-        log.info("Kaggle credentials loaded from environment variables.")
-        return True
-    log.warning(
-        "Kaggle credentials not found.\n"
-        "  Option A: Download kaggle.json from kaggle.com → Account → API\n"
-        f"            and place it at {kaggle_json}\n"
-        "  Option B: Set KAGGLE_USERNAME and KAGGLE_KEY environment variables."
-    )
-    return False
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SHARED SCHEMA UTILITIES
-# ══════════════════════════════════════════════════════════════════════════════
-
-REQUIRED_COLS = [
-    "job_id", "title", "company", "location", "description",
-    "employment_type", "seniority", "salary_min", "salary_max",
-    "salary_midpoint", "remote", "skills", "experience_required",
-    "education_required", "date_posted", "source", "visa_possible",
+META_COLUMNS = [
+    "job_id", "title", "company", "location", "city", "country",
+    "remote", "seniority", "employment_type", "salary_min", "salary_max",
+    "salary_midpoint", "description", "skills_extracted", "experience_required",
+    "visa_possible", "date_posted", "recency_score", "source", "url",
+    "job_text_clean",
 ]
 
 
-def _fill_schema(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure every required column exists with a sensible default."""
-    for col in REQUIRED_COLS:
-        if col not in df.columns:
-            df[col] = {
-                "employment_type": "Full-time",
-                "seniority":       "mid",
-                "salary_min":      0.0,
-                "salary_max":      0.0,
-                "salary_midpoint": 0.0,
-                "remote":          False,
-                "experience_required": 0,
-                "education_required":  "Not specified",
-                "source":          "unknown",
-                "visa_possible":   False,
-            }.get(col, "")
-
-    # job_id fallback
-    mask = df["job_id"].isna() | (df["job_id"].astype(str).str.strip() == "")
-    if mask.any():
-        df.loc[mask, "job_id"] = (
-            df.loc[mask, "title"].astype(str) + df.loc[mask, "company"].astype(str)
-        ).apply(lambda x: hashlib.md5(x.encode()).hexdigest()[:16])
-
-    # Skills must be lists
-    df["skills"] = df["skills"].apply(
-        lambda x: x if isinstance(x, list)
-        else [s.strip() for s in str(x).split(",") if s.strip()]
-        if x and not isinstance(x, float) else []
-    )
-
-    for col in ["salary_min", "salary_max", "salary_midpoint"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-
-    has_mid = df["salary_midpoint"] > 0
-    df.loc[~has_mid, "salary_midpoint"] = (
-        df.loc[~has_mid, "salary_min"] + df.loc[~has_mid, "salary_max"]
-    ) / 2
-
-    df["remote"]        = df["remote"].astype(bool)
-    df["visa_possible"] = df["visa_possible"].astype(bool)
-    df["date_posted"]   = pd.to_datetime(df["date_posted"], errors="coerce").fillna(
-        pd.Timestamp.now()
-    )
-
-    return df[REQUIRED_COLS].reset_index(drop=True)
-
-
-def _infer_seniority(title: str) -> str:
-    t = str(title).lower()
-    if any(k in t for k in ["intern", "entry", "junior", "jr."]):
-        return "junior"
-    if any(k in t for k in ["senior", "sr.", "lead", "principal",
-                              "director", "vp ", "head of", "chief"]):
-        return "senior"
-    return "mid"
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 1 — KAGGLE TECHMAP (training corpus)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_kaggle_20k(out_path: Path) -> pd.DataFrame:
-    """
-    Download Kaggle TechMap, clean with the app's own pipeline, sample 20k rows.
-    These jobs train the embedding model — they are NOT shown as match results.
-    """
-    log.info("━━━  Building Kaggle training corpus  ━━━")
-
-    if not _check_kaggle_creds():
-        raise RuntimeError("Kaggle credentials missing — see instructions above.")
-
-    try:
-        import kagglehub, glob
-    except ImportError:
-        raise ImportError("Run: pip install kagglehub")
-
-    log.info("Downloading from Kaggle (cached after first run)…")
-    path      = kagglehub.dataset_download("techmap/international-job-postings-september-2021")
-    csv_files = sorted(glob.glob(f"{path}/**/*.csv", recursive=True))
-    if not csv_files:
-        raise FileNotFoundError(f"No CSVs found under {path}")
-
-    log.info(f"Found {len(csv_files)} CSV file(s)")
-    chunks, per_file = [], max(TARGET_SIZE // max(len(csv_files), 1) + 1_000, 5_000)
-    for f in csv_files:
-        try:
-            chunks.append(pd.read_csv(f, nrows=per_file, low_memory=False))
-            if sum(len(c) for c in chunks) >= TARGET_SIZE * 1.2:
-                break
-        except Exception as e:
-            log.warning(f"  Skipping {f}: {e}")
-
-    raw = pd.concat(chunks, ignore_index=True)
-    log.info(f"Raw rows: {len(raw):,}")
-
-    try:
-        from src.clean import clean_jobs
-        df = clean_jobs(raw, save=False)
-        log.info(f"After app clean pipeline: {len(df):,} rows")
-    except Exception as e:
-        log.warning(f"src.clean unavailable ({e}) — using fallback normaliser")
-        df = _kaggle_fallback(raw)
-
-    if len(df) > TARGET_SIZE:
-        df = df.sample(TARGET_SIZE, random_state=42).reset_index(drop=True)
-
-    df["source"] = "kaggle"
-    df = _fill_schema(df)
-    df.to_parquet(out_path, index=False)
-    log.info(f"✅  {len(df):,} rows  →  {out_path.name}  "
-             f"({out_path.stat().st_size / 1e6:.1f} MB)")
-    return df
-
-
-def _kaggle_fallback(raw: pd.DataFrame) -> pd.DataFrame:
-    rename = {"jobTitle": "title", "companyName": "company",
-               "jobLocation": "location", "jobDescription": "description",
-               "employmentType": "employment_type",
-               "salaryMin": "salary_min", "salaryMax": "salary_max",
-               "datePosted": "date_posted"}
-    df = raw.rename(columns={k: v for k, v in rename.items() if k in raw.columns}).copy()
-    if "job_id" not in df.columns:
-        df["job_id"] = (df.get("title", "").astype(str) +
-                        df.get("company", "").astype(str)).apply(
-            lambda x: hashlib.md5(x.encode()).hexdigest()[:16] + "_kg")
-    df["seniority"] = df.get("title", "").apply(_infer_seniority)
-    df["remote"]    = df.get("location", "").str.lower().str.contains("remote", na=False)
-    df["source"]    = "kaggle"
-    df["skills"]    = [[] for _ in range(len(df))]
-    df = df[df.get("description", pd.Series([""] * len(df))).fillna("").str.len() > 50]
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SOURCE 2 — JSEARCH SNAPSHOT (match pool)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# Broad employment-signal queries — intentionally NOT job-title specific.
-# The snapshot should contain diverse job types so that embedding similarity
-# (not keyword matching) does all the relevance work at query time.
-# Users' actual job searches (e.g. "data scientist") are used only as part of
-# the candidate's profile embedding — NOT to filter which jobs appear here.
-DEFAULT_QUERIES = [
-    "full time",
-    "remote",
-    "entry level",
-    "senior",
-    "manager",
-    "analyst",
-    "engineer",
-    "developer",
-    "specialist",
-    "associate",
-]
-
-
-def build_jsearch_20k(out_path: Path, queries: list) -> pd.DataFrame:
-    """
-    Fetch real US job postings from JSearch, clean them, save as a static snapshot.
-    country="us" is hardcoded — the pool covers only US-based roles so results are
-    relevant for US job seekers. These jobs are ranked and shown to users at query time.
-    Not live — reflects build date.
-    """
-    log.info("━━━  Building JSearch match-pool snapshot (USA only)  ━━━")
-
-    key = _load_jsearch_key()
-    if not key:
-        raise RuntimeError(
-            "JSearch API key not found.\n"
-            "  Add it to any of these (same files the app uses):\n"
-            f"    {PROJECT_ROOT / '.env'}                    →  JSEARCH_API_KEY=xxx\n"
-            f"    {PROJECT_ROOT / '.streamlit' / 'secrets.toml'}  →  JSEARCH_API_KEY = \"xxx\""
-        )
-
-    # Inject the key so src.ingest picks it up
-    os.environ["JSEARCH_API_KEY"] = key
-
-    try:
-        from src.ingest import fetch_multiple_queries
-        from src.clean import clean_jobs
-    except ImportError as e:
-        raise ImportError(f"Cannot import app modules: {e}. Run from the project root.")
-
-    # Hard cap: 5 pages per query × 10 results/page × 15 queries = ~750 jobs max.
-    # This keeps API usage well within free-tier limits (~75 requests total).
-    # JSearch does NOT paginate a giant DB — each request returns fresh results.
-    # 10 pages × 10 queries × 10 results/page = ~1,000 raw jobs from JSearch.
-    # JSearch caps results per query at ~100 unique, so going beyond 10 pages
-    # yields diminishing returns. 100 total API calls stays within free-tier limits.
-    PAGES_PER_QUERY = 10
-    est_jobs = len(queries) * PAGES_PER_QUERY * 10
-    log.info(f"{len(queries)} queries × {PAGES_PER_QUERY} pages each  (~{est_jobs} raw jobs expected)")
-    log.info(f"Total API calls: ~{len(queries) * PAGES_PER_QUERY}  (within free-tier limits)")
-
-    # country="us" restricts JSearch results to US job postings only.
-    # The embedding model handles all relevance matching — we don't filter by title here.
-    raw = fetch_multiple_queries(queries, pages_per_query=PAGES_PER_QUERY, country="us")
-    if raw.empty:
-        raise RuntimeError("JSearch returned 0 results. Check your API key and rate limits.")
-
-    log.info(f"Raw rows from JSearch: {len(raw):,}")
-    df = clean_jobs(raw, save=False)
-    df = df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
-    log.info(f"After clean + dedup: {len(df):,} rows")
-
-    if len(df) > TARGET_SIZE:
-        df = df.sample(TARGET_SIZE, random_state=42).reset_index(drop=True)
-    elif len(df) < 200:
-        log.warning(
-            f"Only {len(df):,} jobs fetched — very low. Check your API key and rate limits."
-        )
-    else:
-        log.info(f"Snapshot has {len(df):,} jobs — sufficient for the match pool.")
-
-    df["source"] = df.get("source", pd.Series(["jsearch"] * len(df))).fillna("jsearch")
-    df = _fill_schema(df)
-    df.to_parquet(out_path, index=False)
-    log.info(f"✅  {len(df):,} rows  →  {out_path.name}  "
-             f"({out_path.stat().st_size / 1e6:.1f} MB)  "
-             f"[snapshot: {pd.Timestamp.now().strftime('%Y-%m-%d')}]")
-    return df
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _parse_args():
-    p = argparse.ArgumentParser(
-        description="Build JobPilot pre-loaded parquet files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Credentials are read automatically from:\n"
-            "  Kaggle  → ~/.kaggle/kaggle.json  OR  KAGGLE_USERNAME + KAGGLE_KEY env vars\n"
-            "  JSearch → .streamlit/secrets.toml  OR  .env  OR  JSEARCH_API_KEY env var"
-        ),
-    )
-    p.add_argument("--kaggle-only",  action="store_true",
-                   help="Build only the Kaggle training corpus")
-    p.add_argument("--jsearch-only", action="store_true",
-                   help="Build only the JSearch match-pool snapshot")
-    p.add_argument("--queries", type=str, default="",
-                   help="Comma-separated JSearch queries (overrides built-in list)")
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", type=Path,
+                   default=PROJECT_ROOT / "data" / "preloaded_kaggle_50k.parquet",
+                   help="Source parquet (default: data/preloaded_kaggle_50k.parquet)")
     p.add_argument("--force", action="store_true",
-                   help="Rebuild even if output files already exist")
+                   help="Rebuild all artifacts even if they already exist")
+    p.add_argument("--kaggle-only", action="store_true",
+                   help="Legacy alias — same as default (builds all artifacts)")
     return p.parse_args()
 
 
-if __name__ == "__main__":
-    args = _parse_args()
+def _load_source(source_path: Path) -> "pd.DataFrame":
+    import pandas as pd
+    if not source_path.exists():
+        log.error(
+            f"Source parquet not found: {source_path}\n"
+            "Place preloaded_kaggle_50k.parquet in data/ (gitignored, never shipped)."
+        )
+        sys.exit(1)
+    log.info(f"Loading source: {source_path.name}  ({source_path.stat().st_size / 1e6:.1f} MB)")
+    df = pd.read_parquet(source_path)
+    log.info(f"  Loaded {len(df):,} rows × {len(df.columns)} columns")
+    if "job_id" not in df.columns:
+        log.error("Source parquet missing 'job_id' column"); sys.exit(1)
+    df = df.drop_duplicates(subset=["job_id"]).reset_index(drop=True)
+    log.info(f"  After dedup: {len(df):,} rows")
+    return df
+
+
+def _build_job_meta(df: "pd.DataFrame", data_dir: Path, force: bool) -> "pd.DataFrame":
+    """Write job_meta.parquet with display/ranking columns + full descriptions."""
+    import pandas as pd
+    meta_path = data_dir / "job_meta.parquet"
+
+    if not force and meta_path.exists():
+        log.info(f"job_meta.parquet exists ({meta_path.stat().st_size/1e6:.1f} MB) — skipping")
+        return pd.read_parquet(meta_path)
+
+    log.info("Building job_meta.parquet …")
+    df = df.copy()
+
+    if "salary_midpoint" not in df.columns:
+        s_min = df["salary_min"].fillna(0).astype(float)
+        s_max = df["salary_max"].fillna(0).astype(float)
+        df["salary_midpoint"] = ((s_min + s_max) / 2).where((s_min > 0) | (s_max > 0), 0.0)
+
+    if "job_text_clean" not in df.columns:
+        log.info("  Building job_text_clean from fields …")
+        from src.embeddings import build_job_text
+        df["job_text_clean"] = [build_job_text(row) for _, row in df.iterrows()]
+
+    present  = [c for c in META_COLUMNS if c in df.columns]
+    missing  = set(META_COLUMNS) - set(present)
+    if missing:
+        log.warning(f"  Columns absent from source (will be missing): {missing}")
+
+    meta_df = df[present].copy()
+
+    def _norm_skills(v):
+        if v is None: return []
+        if hasattr(v, "tolist"): return v.tolist()
+        if isinstance(v, (list, tuple)): return list(v)
+        if isinstance(v, str):
+            import ast
+            try: return ast.literal_eval(v)
+            except Exception: return []
+        return []
+
+    meta_df["skills_extracted"] = meta_df["skills_extracted"].apply(_norm_skills)
+
+    tmp = meta_path.with_suffix(".tmp.parquet")
+    meta_df.to_parquet(tmp, index=False, compression="snappy")
+    tmp.replace(meta_path)
+
+    log.info(f"  job_meta.parquet: {len(meta_df):,} rows, {meta_path.stat().st_size/1e6:.1f} MB")
+    return meta_df
+
+
+def _build_vector_index(df: "pd.DataFrame", data_dir: Path, force: bool) -> "np.ndarray":
+    """Embed corpus, quantize int8, write vector_index.zip. Returns float32 embeddings."""
+    import numpy as np
+    from src.embeddings import embed, quantize_int8
+
+    zip_path = data_dir / "vector_index.zip"
+
+    if not force and zip_path.exists():
+        log.info(f"vector_index.zip exists ({zip_path.stat().st_size/1e6:.1f} MB) — skipping")
+        import json as _json
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            with zf.open("scale.json") as f:
+                meta = _json.load(f)
+            with zf.open("embeddings_int8.npy") as f:
+                q = np.load(f)
+        scale = float(meta["scale"])
+        v = q.astype(np.float32) * scale
+        norms = np.linalg.norm(v, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        return (v / norms).astype(np.float32)
+
+    log.info(f"Embedding {len(df):,} jobs …")
+    t0 = time.time()
+    texts      = df["job_text_clean"].fillna("").tolist()
+    embeddings = embed(texts, batch_size=256, show_progress=True)
+    log.info(f"  Embeddings: {embeddings.shape}  in {time.time()-t0:.1f}s")
+
+    log.info("  Quantizing to int8 …")
+    q, scale = quantize_int8(embeddings)
+    job_ids  = df["job_id"].tolist()
+
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        np.save(tmp_dir / "embeddings_int8.npy", q)
+        (tmp_dir / "scale.json").write_text(json.dumps({
+            "scale": scale,
+            "dim":   int(embeddings.shape[1]),
+            "count": int(embeddings.shape[0]),
+        }, indent=2))
+        np.save(tmp_dir / "job_ids.npy", np.array(job_ids))
+
+        tmp_zip = zip_path.with_suffix(".tmp.zip")
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            zf.write(tmp_dir / "embeddings_int8.npy", "embeddings_int8.npy")
+            zf.write(tmp_dir / "scale.json",          "scale.json")
+            zf.write(tmp_dir / "job_ids.npy",         "job_ids.npy")
+        tmp_zip.replace(zip_path)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    raw_mb  = embeddings.nbytes / 1e6
+    zip_mb  = zip_path.stat().st_size / 1e6
+    log.info(f"  vector_index.zip: {zip_mb:.1f} MB  ({raw_mb/zip_mb:.1f}× smaller than raw float32)")
+    return embeddings
+
+
+def _build_clusters(embeddings: "np.ndarray", job_ids: list, data_dir: Path, force: bool) -> None:
+    """K-Means → job_clusters.npz + cluster_state.json (atomic write)."""
+    import numpy as np
+    from datetime import datetime, timezone
+
+    clusters_path = data_dir / "job_clusters.npz"
+    state_path    = data_dir / "cluster_state.json"
+
+    if not force and clusters_path.exists():
+        log.info("job_clusters.npz exists — skipping"); return
+
+    N_CLUSTERS = 30
+    log.info(f"K-Means: {len(embeddings):,} jobs → {N_CLUSTERS} families …")
+    t0 = time.time()
+
+    from sklearn.cluster import MiniBatchKMeans
+    km = MiniBatchKMeans(n_clusters=N_CLUSTERS, random_state=42,
+                         batch_size=min(2048, len(embeddings)), n_init=5, max_iter=150)
+    labels = km.fit_predict(embeddings).astype(np.int32)
+    sizes  = np.bincount(labels)
+    log.info(f"  Done {time.time()-t0:.1f}s — sizes min={sizes.min()} max={sizes.max()} mean={sizes.mean():.0f}")
+
+    tmp = clusters_path.with_suffix(".tmp.npz")
+    np.savez(tmp, labels=labels, centers=km.cluster_centers_.astype("float32"),
+             n_clusters=np.int32(N_CLUSTERS), job_ids=np.array(job_ids))
+    tmp.replace(clusters_path)
+
+    state_path.write_text(json.dumps({
+        "last_build_ts":   datetime.now(timezone.utc).isoformat(),
+        "n_at_last_build": len(job_ids),
+    }, indent=2))
+    log.info(f"  job_clusters.npz: {clusters_path.stat().st_size/1e6:.2f} MB")
+
+
+def _verify(data_dir: Path) -> bool:
+    """Assert shipped artifacts exist and are within size limits."""
+    SHIPPED = {
+        "vector_index.zip": data_dir / "vector_index.zip",
+        "job_meta.parquet": data_dir / "job_meta.parquet",
+        "job_clusters.npz": data_dir / "job_clusters.npz",
+        "personas.json":    data_dir / "personas.json",
+    }
+    FORBIDDEN_NAMES = [
+        "preloaded_kaggle_50k.parquet", "jobpilot.db",
+        "embeddings.npy", "faiss_index.bin",
+        "jsearch_embeddings.npy", "jsearch_job_ids.npy",
+    ]
+
+    print("\n" + "=" * 60)
+    print("  Build Verification")
+    print("=" * 60)
+
+    all_ok = True
+    for name, path in SHIPPED.items():
+        if not path.exists():
+            print(f"  ❌ MISSING : {name}"); all_ok = False
+        else:
+            mb = path.stat().st_size / 1e6
+            ok = mb < MAX_ARTIFACT_MB
+            print(f"  {'✅' if ok else '❌ TOO LARGE'}  {name}  {mb:.1f} MB")
+            if not ok: all_ok = False
 
     print()
-    log.info("╔══════════════════════════════════════════════════╗")
-    log.info("║  JobPilot — Pre-loaded Data Builder              ║")
-    log.info("╚══════════════════════════════════════════════════╝")
-    log.info(f"Project root : {PROJECT_ROOT}")
-    log.info(f"Output dir   : {DATA_DIR}")
-    log.info(f"Target size  : {TARGET_SIZE:,} rows per file\n")
+    forbidden_present = [f for f in (data_dir / n for n in FORBIDDEN_NAMES) if f.exists()]
+    if forbidden_present:
+        print("  ⚠️  Present locally (gitignored — excluded from shipped folder):")
+        for f in forbidden_present:
+            print(f"       {f.name}  {f.stat().st_size/1e6:.1f} MB")
+    else:
+        print("  ✅  No forbidden files present in data/")
 
-    kaggle_out  = DATA_DIR / "preloaded_kaggle_50k.parquet"
-    jsearch_out = DATA_DIR / "preloaded_jsearch_50k.parquet"
+    print()
+    if all_ok:
+        print("  ✅  safe to assemble folder")
+        print("      → python scripts/assemble_folder.py")
+    else:
+        print("  ❌  fix issues above before assembling")
+    print("=" * 60 + "\n")
+    return all_ok
 
-    queries = (
-        [q.strip() for q in args.queries.split(",") if q.strip()]
-        if args.queries.strip() else DEFAULT_QUERIES
-    )
 
-    build_kaggle  = not args.jsearch_only
-    build_jsearch = not args.kaggle_only
-    results       = {}
+def main() -> None:
+    args     = _parse_args()
+    data_dir = PROJECT_ROOT / "data"
+    data_dir.mkdir(exist_ok=True)
 
-    # ── Kaggle ────────────────────────────────────────────────────────────────
-    if build_kaggle:
-        if kaggle_out.exists() and not args.force:
-            n = len(pd.read_parquet(kaggle_out))
-            log.info(f"⏭  Kaggle file already exists ({n:,} rows) — skipping.")
-            log.info(f"   Use --force to rebuild: python scripts/build_preloaded_data.py --force")
-            results["kaggle"] = True
-        else:
-            try:
-                build_kaggle_20k(kaggle_out)
-                results["kaggle"] = True
-            except Exception as e:
-                log.error(f"❌ Kaggle build failed: {e}")
-                results["kaggle"] = False
-        print()
+    log.info("=" * 60)
+    log.info("JobPilot — Offline Artifact Builder")
+    log.info(f"Source : {args.source}")
+    log.info(f"Force  : {args.force}")
+    log.info("=" * 60 + "\n")
 
-    # ── JSearch ───────────────────────────────────────────────────────────────
-    if build_jsearch:
-        if jsearch_out.exists() and not args.force:
-            n = len(pd.read_parquet(jsearch_out))
-            log.info(f"⏭  JSearch snapshot already exists ({n:,} rows) — skipping.")
-            log.info(f"   Use --force to refresh: python scripts/build_preloaded_data.py --force")
-            results["jsearch"] = True
-        else:
-            try:
-                build_jsearch_20k(jsearch_out, queries)
-                results["jsearch"] = True
-            except Exception as e:
-                log.error(f"❌ JSearch build failed: {e}")
-                results["jsearch"] = False
-        print()
+    t_start = time.time()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    log.info("─" * 55)
-    log.info("DONE")
-    log.info("─" * 55)
+    df      = _load_source(args.source)
+    meta_df = _build_job_meta(df, data_dir, args.force)
+    embeds  = _build_vector_index(meta_df, data_dir, args.force)
+    _build_clusters(embeds, meta_df["job_id"].tolist(), data_dir, args.force)
 
-    if results.get("kaggle"):
-        mb = kaggle_out.stat().st_size / 1e6
-        log.info(f"✅  {kaggle_out.name:40s}  {mb:.1f} MB  (training corpus)")
-        if mb > 50:
-            log.warning(f"   ⚠️  {mb:.0f} MB — too large for GitHub. Use Git LFS or share separately.")
-        else:
-            log.info(f"   ✅  GitHub-safe size — you can commit this file.")
-    elif build_kaggle:
-        log.info("❌  Kaggle training corpus — FAILED")
+    log.info(f"\nTotal build time: {time.time()-t_start:.1f}s")
+    _verify(data_dir)
 
-    if results.get("jsearch"):
-        mb = jsearch_out.stat().st_size / 1e6
-        log.info(f"✅  {jsearch_out.name:40s}  {mb:.1f} MB  (match pool snapshot)")
-        if mb > 50:
-            log.warning(f"   ⚠️  {mb:.0f} MB — too large for GitHub. Use Git LFS or share separately.")
-        else:
-            log.info(f"   ✅  GitHub-safe size — you can commit this file.")
-    elif build_jsearch:
-        log.info("❌  JSearch snapshot — FAILED")
 
-    if any(results.values()):
-        log.info("")
-        log.info("🚀  The app will detect these files automatically on next launch.")
-        log.info("    No upload needed — just start the app and run the pipeline.")
-    log.info("─" * 55)
+if __name__ == "__main__":
+    main()

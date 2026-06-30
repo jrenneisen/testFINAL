@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 ranker.py — Multi-stage job ranking pipeline for JobPilot.
 
@@ -163,13 +164,21 @@ def score_jobs(
             continue
 
         # --- Skill Match ---
-        job_skills = set(s.lower() for s in (row.get("skills_extracted") or []))
-        if isinstance(row.get("skills_extracted"), str):
-            import ast
+        import ast as _ast
+        _raw_skills = row.get("skills_extracted")
+        if _raw_skills is None:
+            job_skills = set()
+        elif hasattr(_raw_skills, "tolist"):          # numpy array
+            job_skills = set(s.lower() for s in _raw_skills.tolist())
+        elif isinstance(_raw_skills, str):
             try:
-                job_skills = set(s.lower() for s in ast.literal_eval(row["skills_extracted"]))
+                job_skills = set(s.lower() for s in _ast.literal_eval(_raw_skills))
             except Exception:
                 job_skills = set()
+        elif isinstance(_raw_skills, (list, tuple)):
+            job_skills = set(s.lower() for s in _raw_skills)
+        else:
+            job_skills = set()
 
         matched  = list(profile_skills & job_skills)
         missing  = list(job_skills - profile_skills)
@@ -233,13 +242,19 @@ def score_jobs(
             sal_min_pref, exp_fit, job_exp_req, user_exp
         )
 
-        skills_list = list(row.get("skills_extracted") or [])
-        if isinstance(skills_list, str):
-            import ast
+        _sk = row.get("skills_extracted")
+        if _sk is None:
+            skills_list = []
+        elif hasattr(_sk, "tolist"):
+            skills_list = _sk.tolist()
+        elif isinstance(_sk, str):
+            import ast as _ast2
             try:
-                skills_list = ast.literal_eval(skills_list)
+                skills_list = _ast2.literal_eval(_sk)
             except Exception:
                 skills_list = []
+        else:
+            skills_list = list(_sk)
 
         ranked_jobs.append(RankedJob(
             job_id                = str(job_id),
@@ -365,6 +380,28 @@ def rank_jobs(
     if feedback:
         ranked = _apply_feedback_boosts(ranked, feedback)
         ranked.sort(key=lambda j: j.final_score, reverse=True)
+
+    # ── Match-time dedup (Step 4.5) ───────────────────────────────────────────
+    # The match pool is base ∪ live; the same posting can appear twice (same
+    # job_id from two sources, or same role at same company with different IDs).
+    # Dedup here — BEFORE truncating to top_n — so the user always gets top_n
+    # distinct results rather than top_n minus hidden duplicates.
+    #
+    # Pass 1 — exact job_id dedup (keep highest-scored instance)
+    seen_ids: dict[str, RankedJob] = {}
+    for job in ranked:
+        if job.job_id not in seen_ids or job.final_score > seen_ids[job.job_id].final_score:
+            seen_ids[job.job_id] = job
+    ranked = sorted(seen_ids.values(), key=lambda j: j.final_score, reverse=True)
+
+    # Pass 2 — near-dup dedup: same (title, company) from different sources
+    # e.g., the same Kaggle posting re-ingested via JSearch with a new ID.
+    seen_pairs: dict[tuple[str, str], RankedJob] = {}
+    for job in ranked:
+        key = (job.title.lower().strip(), job.company.lower().strip())
+        if key not in seen_pairs or job.final_score > seen_pairs[key].final_score:
+            seen_pairs[key] = job
+    ranked = sorted(seen_pairs.values(), key=lambda j: j.final_score, reverse=True)
 
     # Stage 3: MMR re-rank
     final = mmr_rerank(ranked, top_n=top_n)
